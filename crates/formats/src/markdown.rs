@@ -1100,8 +1100,18 @@ fn escape_line_start(s: String) -> String {
 }
 
 fn code_span(t: &str) -> String {
-    let mut longest = 0;
-    let mut cur = 0;
+    // A code span is read as a line ending when it holds one, and the next line could then start
+    // a raw HTML block (`<script>`): a line break in the span becomes a space (WC-38), which is
+    // what CommonMark renders it as anyway.
+    let t = &t.replace(['\r', '\n'], " ");
+    let ticks = "`".repeat(longest_backtick_run(t) + 1);
+    let pad = if t.starts_with('`') || t.ends_with('`') || (t.starts_with(' ') && t.ends_with(' ') && !t.trim().is_empty()) { " " } else { "" };
+    format!("{ticks}{pad}{t}{pad}{ticks}")
+}
+
+/// The longest run of consecutive backticks in `t`.
+fn longest_backtick_run(t: &str) -> usize {
+    let (mut longest, mut cur) = (0usize, 0usize);
     for c in t.chars() {
         if c == '`' {
             cur += 1;
@@ -1110,9 +1120,7 @@ fn code_span(t: &str) -> String {
             cur = 0;
         }
     }
-    let ticks = "`".repeat(longest + 1);
-    let pad = if t.starts_with('`') || t.ends_with('`') || (t.starts_with(' ') && t.ends_with(' ') && !t.trim().is_empty()) { " " } else { "" };
-    format!("{ticks}{pad}{t}{pad}{ticks}")
+    longest
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -1325,8 +1333,10 @@ fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>) {
                     lines.push(q.text());
                     i += 1;
                 }
-                let longest = lines.iter().map(|l| l.chars().filter(|c| *c == '`').count()).max().unwrap_or(0);
-                let fence = "`".repeat(3.max(longest + 1).min(64));
+                // Longer than any run of backticks in the code, so no code line can close it early
+                // (WC-38); never capped, the run is in the text already.
+                let longest = lines.iter().map(|l| longest_backtick_run(l)).max().unwrap_or(0);
+                let fence = "`".repeat(3.max(longest.saturating_add(1)));
                 out.push(fence.clone());
                 out.extend(lines);
                 out.push(fence);

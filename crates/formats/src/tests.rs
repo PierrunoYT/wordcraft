@@ -737,6 +737,67 @@ fn exported_links_keep_only_safe_targets() {
     }
 }
 
+/// WC-38 (#2777): text in a code span or code block can't break out of it into raw HTML in the
+/// exported Markdown: a line break in a code span becomes a space, and a code block's fence is
+/// longer than any backtick run in it, however long.
+#[test]
+fn markdown_code_cannot_break_out_into_raw_html() {
+    let mono = CharProps { font: Some("Courier New".into()), ..Default::default() };
+    let mut p = Paragraph::with_text("Run ", CharProps::default());
+    let n = p.len();
+    p.insert_text(n, "x\n<script>alert(1)</script>", &mono).unwrap();
+    let ticks = "`".repeat(100);
+    let block = Paragraph::with_text(&format!("{ticks}\n<script>alert(2)</script>"), CharProps::default()).styled("Code");
+    let mut d = Document::new();
+    d.body = vec![para_block(p), para_block(block)];
+    let md = String::from_utf8(export("md", &d).unwrap().unwrap()).unwrap();
+    assert!(md.contains("`x <script>alert(1)</script>`"), "{md}");
+    // The fence is longer than the 100-backtick run, so it is still open at the `<script>` line.
+    let fence = md.lines().find(|l| l.starts_with("```")).unwrap_or_default();
+    assert!(fence.len() > 100 && fence.chars().all(|c| c == '`'), "{md}");
+    let lines: Vec<&str> = md.lines().collect();
+    let open = lines.iter().position(|l| *l == fence).unwrap();
+    let close = lines.iter().rposition(|l| *l == fence).unwrap();
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim_start().starts_with("<script") {
+            assert!(open < i && i < close, "raw HTML outside code at line {i}: {md}");
+        }
+    }
+    // Read back, nothing is HTML: the code text survives as text.
+    let back = import("md", md.as_bytes()).unwrap().unwrap().plain_text(Default::default());
+    assert!(back.contains("<script>alert(1)</script>") && back.contains("<script>alert(2)</script>"), "{back}");
+}
+
+/// WC-38 (#2777): a font name can't break out of the exported HTML `font-family` string or the
+/// RTF font table.
+#[test]
+fn font_names_cannot_break_out_of_html_css_or_rtf_font_table() {
+    let mut d = Document::new();
+    let mut p = Paragraph::with_text("", CharProps::default());
+    for (i, font) in
+        ["Evil'}\nbody{background:url(//x.example)}", "Evil\\27;color:red", "Evil;}{\\f9 Forged;}{\\*\\x", "Noto Sans CJK JP"].iter().enumerate()
+    {
+        let n = p.len();
+        p.insert_text(n, &format!("run{i} "), &CharProps { font: Some((*font).into()), ..Default::default() }).unwrap();
+    }
+    d.body = vec![para_block(p)];
+    let html = String::from_utf8(export("html", &d).unwrap().unwrap()).unwrap();
+    let families: Vec<&str> = html.split("font-family:'").skip(1).filter_map(|s| s.split_once('\'').map(|(f, _)| f)).collect();
+    assert!(families.contains(&"Noto Sans CJK JP"), "{html}");
+    assert!(families.contains(&"Evilbodybackgroundurlx.example"), "{html}");
+    for f in &families {
+        assert!(f.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.')), "{f:?} in {html}");
+    }
+    let rtf = String::from_utf8(export("rtf", &d).unwrap().unwrap()).unwrap();
+    let table = rtf.split_once("{\\fonttbl").and_then(|(_, t)| t.split_once("}\n")).map(|(t, _)| t).unwrap_or_default();
+    // One `;` per entry: no name adds one.
+    let entries = table.matches("{\\f").count();
+    assert_eq!(table.matches(';').count(), entries, "{table}");
+    assert!(!table.contains("Forged;") && !table.contains("{\\f9"), "{table}");
+    let back = import("rtf", rtf.as_bytes()).unwrap().unwrap().plain_text(Default::default());
+    assert!(back.contains("run0") && back.contains("run3"), "{back}");
+}
+
 #[test]
 fn hidden_drawings_are_left_out_of_exports() {
     let mut d = wordcraft_doc::Document::from_text("x");

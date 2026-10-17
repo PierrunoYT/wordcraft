@@ -1364,8 +1364,15 @@ pub fn inlines_html(inlines: &[Inline]) -> String {
                 if let Some(s) = f.size {
                     css.push(format!("font-size:{}pt", trim_num(s)));
                 }
-                if let Some(fam) = &f.font {
-                    css.push(format!("font-family:'{}'", esc(&fam.replace('\'', ""))));
+                // Only letters, digits, spaces, `-`, `_` and `.` stay in the quoted CSS name: a
+                // quote, backslash or newline would end the string early and let the rest of
+                // the name be read as CSS (WC-38).
+                let fam = f
+                    .font
+                    .as_deref()
+                    .map(|fam| fam.chars().filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.')).collect::<String>());
+                if let Some(fam) = fam.filter(|fam| !fam.trim().is_empty()) {
+                    css.push(format!("font-family:'{}'", fam.trim()));
                 }
                 if !css.is_empty() {
                     open.push_str(&format!("<span style=\"{}\">", css.join(";")));

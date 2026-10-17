@@ -499,7 +499,10 @@ fn export_with(m: &Meta, w: &Writer, body: &str, sec: &wordcraft_doc::SectionPro
     let mut out = String::from("{\\rtf1\\ansi\\ansicpg1252\\deff0\\deflang1033\\uc1\n{\\fonttbl");
     for (i, f) in w.t.fonts.iter().enumerate() {
         let fam = if model::is_mono(f) { "\\fmodern" } else { "\\fswiss" };
-        out.push_str(&format!("{{\\f{i}{fam}\\fcharset0 {};}}", esc(f)));
+        // `;` ends a font table entry, so one in the name would start a forged entry (WC-38);
+        // control characters have no place in a name. `esc` escapes `\`, `{` and `}`.
+        let name: String = f.chars().filter(|c| *c != ';' && !c.is_control()).collect();
+        out.push_str(&format!("{{\\f{i}{fam}\\fcharset0 {};}}", esc(&name)));
     }
     out.push_str("}\n{\\colortbl;");
     for c in &w.t.colors {
