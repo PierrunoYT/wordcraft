@@ -544,7 +544,7 @@ fn apply_style(css: &str, f: &mut Fmt, align: &mut Option<Align>, preserve: &mut
                 }
             }
             "font-family" => {
-                let fam = v.split(',').next().unwrap_or("").trim().trim_matches(['"', '\'']).to_string();
+                let fam = model::cap_name(v.split(',').next().unwrap_or("").trim().trim_matches(['"', '\''])).to_string();
                 if model::is_mono(&fam) || fam.eq_ignore_ascii_case("monospace") {
                     f.code = true;
                 } else if !fam.is_empty() && !matches!(fam.to_ascii_lowercase().as_str(), "serif" | "sans-serif" | "inherit" | "initial") {
@@ -1017,7 +1017,7 @@ impl<'r> Builder<'r> {
                     fmt.color = Some(c);
                 }
                 if let Some(face) = attr(attrs, "face") {
-                    let fam = face.split(',').next().unwrap_or("").trim().to_string();
+                    let fam = model::cap_name(face.split(',').next().unwrap_or("").trim()).to_string();
                     if model::is_mono(&fam) {
                         fmt.code = true;
                     } else if !fam.is_empty() {
@@ -1029,7 +1029,7 @@ impl<'r> Builder<'r> {
                 }
             }
             "a" => {
-                if let Some(h) = attr(attrs, "href").filter(|h| wordcraft_doc::link::is_safe_href(h)) {
+                if let Some(h) = attr(attrs, "href").filter(|h| h.trim().len() <= model::MAX_LINK && wordcraft_doc::link::is_safe_href(h)) {
                     fmt.link = Some(h.trim().to_string());
                 }
             }

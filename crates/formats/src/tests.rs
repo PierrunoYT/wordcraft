@@ -323,6 +323,56 @@ fn text_sniffing() {
     assert!(!is_text(&[1, 0, 2, 0, 3]));
 }
 
+/// Every text span of `blocks` (top level), with its formatting.
+fn spans(blocks: &[FBlock]) -> Vec<(String, model::Fmt)> {
+    blocks
+        .iter()
+        .filter_map(|b| if let FBlock::Para(p) = b { Some(p) } else { None })
+        .flat_map(|p| &p.inlines)
+        .filter_map(|i| if let model::Inline::Text(t, f) = i { Some((t.clone(), f.clone())) } else { None })
+        .collect()
+}
+
+#[test]
+fn font_names_and_links_are_capped_at_the_source() {
+    // #2759: a font name or link target of any length was copied into every run that used it,
+    // so a 1 MB name and 100k short runs took about 100 GB. Names are cut, long links dropped.
+    let name = "A".repeat(1 << 20);
+    let url = format!("http://x.test/{}", "c".repeat(model::MAX_LINK));
+    let fonts_ok = |s: &[(String, model::Fmt)]| s.iter().all(|(_, f)| f.font.as_ref().is_none_or(|n| n.len() <= model::MAX_NAME));
+    let link_of = |s: &[(String, model::Fmt)], t: &str| s.iter().find(|(x, _)| x.contains(t)).and_then(|(_, f)| f.link.clone());
+
+    let rtf = format!(r"{{\rtf1{{\fonttbl{{\f1 {name};}}}}{{\stylesheet{{\s1 {name};}}}}\f1 {}\par}}", r"{\b a}a".repeat(1000));
+    let flow = crate::rtf::parse(rtf.as_bytes()).unwrap();
+    let s = spans(&flow.blocks);
+    assert!(s.iter().any(|(_, f)| f.font.as_ref().is_some_and(|n| n.len() == model::MAX_NAME)));
+    assert!(fonts_ok(&s));
+
+    let html = format!(
+        r#"<p><font face="{name}">f</font><span style="font-family:'{}'">s</span><a href="{url}">long</a><a href="http://ok.test">short</a></p>"#,
+        "B".repeat(1 << 20)
+    );
+    let s = spans(&crate::html::parse(&html).blocks);
+    assert!(fonts_ok(&s));
+    assert_eq!(s.iter().filter(|(_, f)| f.font.as_ref().is_some_and(|n| n.len() == model::MAX_NAME)).count(), 2);
+    assert_eq!(link_of(&s, "long"), None);
+    assert_eq!(link_of(&s, "short").as_deref(), Some("http://ok.test"));
+
+    let s = spans(&crate::markdown::parse(&format!("[long]({url}) [short](http://ok.test)")).blocks);
+    assert_eq!(link_of(&s, "long"), None);
+    assert_eq!(link_of(&s, "short").as_deref(), Some("http://ok.test"));
+
+    let label = "c".repeat(model::MAX_LINK);
+    let tex = format!(r"\href{{{url}}}{{long}} \url{{{url}}} \hyperlink{{{label}}}{{target}} \ref{{{label}}} \href{{http://ok.test}}{{short}}");
+    let s = spans(&crate::latex::parse(&tex).blocks);
+    assert!(s.iter().all(|(t, f)| f.link.as_ref().is_none_or(|l| l.len() <= model::MAX_LINK) && !t.is_empty()));
+    assert_eq!(link_of(&s, "long"), None);
+    assert_eq!(link_of(&s, "target"), None);
+    assert_eq!(link_of(&s, "short").as_deref(), Some("http://ok.test"));
+    // The text of a dropped `\url` is still there.
+    assert!(s.iter().any(|(t, _)| t.contains("http://x.test/ccc")));
+}
+
 #[test]
 fn dispatch_unknown() {
     assert!(import("xyz", b"").is_none());

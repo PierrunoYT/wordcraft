@@ -19,6 +19,26 @@ pub const MONO_FONT: &str = "Courier New";
 pub const CODE_STYLE: &str = "Code";
 /// Nesting limit for tables in tables (hostile input).
 pub const MAX_DEPTH: usize = 8;
+/// Longest font or style name an importer keeps, in bytes. A run's formatting carries its own
+/// copy of the font name, so an unbounded one was copied into every run (hostile input).
+pub const MAX_NAME: usize = 256;
+/// Longest link target an importer keeps, in bytes; a longer one is dropped (cut, it would
+/// point somewhere else). Like a font name, it is copied into every run of the link.
+pub const MAX_LINK: usize = 8 << 10;
+
+/// `s` cut to at most [`MAX_NAME`] bytes, at a character boundary.
+pub fn cap_name(s: &str) -> &str {
+    let mut end = s.len().min(MAX_NAME);
+    while !s.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    s.get(..end).unwrap_or("")
+}
+
+/// `url` as a link target, unless it is longer than [`MAX_LINK`].
+pub fn cap_link(url: String) -> Option<String> {
+    (url.len() <= MAX_LINK).then_some(url)
+}
 
 /// Character formatting the text formats can express.
 #[derive(Clone, Debug, Default, PartialEq)]

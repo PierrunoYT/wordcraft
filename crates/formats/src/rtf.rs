@@ -1136,7 +1136,7 @@ impl Reader {
                 for c in s.chars() {
                     if c == ';' {
                         self.commit_font();
-                    } else {
+                    } else if self.font_name.len() < model::MAX_NAME {
                         self.font_name.push(c);
                     }
                 }
@@ -1156,7 +1156,7 @@ impl Reader {
                 for c in s.chars() {
                     if c == ';' {
                         self.commit_style();
-                    } else {
+                    } else if self.style_name.len() < model::MAX_NAME {
                         self.style_name.push(c);
                     }
                 }

@@ -843,7 +843,7 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
                     Some((inner, dest, end)) if base.link.is_none() => {
                         flush!();
                         let mut f = base.clone();
-                        f.link = Some(dest);
+                        f.link = model::cap_link(dest);
                         for x in parse_inlines(&inner, &f, depth + 1) {
                             nodes.push(Node::Inl(x));
                         }

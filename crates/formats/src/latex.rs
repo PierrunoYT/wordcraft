@@ -2287,20 +2287,30 @@ impl<'a> Parser<'a> {
                 }
             }
             "href" => {
-                let url = self.arg_raw();
-                self.with_arg(move |f| f.link = Some(url));
+                let url = model::cap_link(self.arg_raw());
+                self.with_arg(move |f| {
+                    if let Some(u) = url {
+                        f.link = Some(u);
+                    }
+                });
             }
             "url" | "nolinkurl" => {
                 let url = self.arg_raw();
                 let mut f = self.fmt();
-                if name == "url" {
-                    f.link = Some(url.clone());
+                if name == "url"
+                    && let Some(u) = model::cap_link(url.clone())
+                {
+                    f.link = Some(u);
                 }
                 self.para.push_text(&url, &f);
             }
             "hyperlink" => {
-                let target = self.arg_raw();
-                self.with_arg(move |f| f.link = Some(format!("#{target}")));
+                let target = model::cap_link(format!("#{}", self.arg_raw()));
+                self.with_arg(move |f| {
+                    if let Some(t) = target {
+                        f.link = Some(t);
+                    }
+                });
             }
             "hypertarget" => {
                 let target = self.arg_raw();
@@ -2314,7 +2324,9 @@ impl<'a> Parser<'a> {
             "ref" | "eqref" | "pageref" | "autoref" | "cref" | "Cref" | "nameref" => {
                 let l = self.arg_raw();
                 let mut f = self.fmt();
-                f.link = Some(format!("#{l}"));
+                if let Some(target) = model::cap_link(format!("#{l}")) {
+                    f.link = Some(target);
+                }
                 self.para.push_text(&l, &f);
             }
             "cite" | "citep" | "citet" | "parencite" | "textcite" | "autocite" => {

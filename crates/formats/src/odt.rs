@@ -1093,7 +1093,7 @@ impl Styles {
                             d.size = Some(sz);
                         }
                         if let Some(fam) = get(&a, "fo:font-family").or_else(|| get(&a, "style:font-name")) {
-                            let fam = fam.split(',').next().unwrap_or("").trim().trim_matches(['\'', '"']).to_string();
+                            let fam = model::cap_name(fam.split(',').next().unwrap_or("").trim().trim_matches(['\'', '"'])).to_string();
                             if model::is_mono(&fam) || get(&a, "style:font-pitch") == Some("fixed") {
                                 d.code = Some(true);
                             } else if !fam.is_empty() {
@@ -1669,7 +1669,7 @@ impl Body<'_> {
             }
             "a" => {
                 let mut f = self.cur_fmt();
-                if let Some(h) = get(a, "xlink:href").filter(|h| !h.is_empty()) {
+                if let Some(h) = get(a, "xlink:href").filter(|h| !h.is_empty() && h.len() <= model::MAX_LINK) {
                     f.link = Some(h.to_string());
                 }
                 if let Some(s) = get(a, "text:style-name") {
@@ -2473,6 +2473,26 @@ mod tests {
 
     fn paras(f: &Flow) -> Vec<&Para> {
         f.blocks.iter().filter_map(|b| if let FBlock::Para(p) = b { Some(p) } else { None }).collect()
+    }
+
+    #[test]
+    fn font_names_and_links_are_capped() {
+        // #2759: a style's font name and a link's target were copied, whole, into every run.
+        let name = "F".repeat(1 << 20);
+        let url = format!("http://x.test/{}", "c".repeat(model::MAX_LINK));
+        let content = format!(
+            r#"<office:document-content {NS_T}><office:automatic-styles><style:style style:name="T1" style:family="text"><style:text-properties fo:font-family="'{name}'"/></style:style></office:automatic-styles><office:body><office:text><text:p><text:span text:style-name="T1">f</text:span><text:a xlink:href="{url}">long</text:a><text:a xlink:href="http://ok.test">short</text:a></text:p></office:text></office:body></office:document-content>"#
+        );
+        let flow = parse(&zip_of(&[("content.xml", content.as_bytes())])).unwrap();
+        let fmt_of = |t: &str| {
+            paras(&flow).into_iter().flat_map(|p| &p.inlines).find_map(|i| match i {
+                Inline::Text(x, f) if x == t => Some(f.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(fmt_of("f").and_then(|f| f.font).map(|n| n.len()), Some(model::MAX_NAME));
+        assert_eq!(fmt_of("long").map(|f| f.link), Some(None));
+        assert_eq!(fmt_of("short").and_then(|f| f.link).as_deref(), Some("http://ok.test"));
     }
 
     #[test]
