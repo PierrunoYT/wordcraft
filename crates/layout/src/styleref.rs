@@ -149,6 +149,11 @@ pub struct StyleIndex {
     by_path: HashMap<Path, usize>,
     /// Lower-cased style id or name → (id, character style).
     styles: HashMap<String, (String, bool)>,
+    /// Entries by paragraph style id, ascending: a header's STYLEREF on every page finds its
+    /// paragraph by binary search, not by walking the body (WC-26).
+    para_styles: HashMap<String, Vec<usize>>,
+    /// Entries with a run in each character style id, ascending.
+    char_styles: HashMap<String, Vec<usize>>,
 }
 
 fn clean(s: &str) -> String {
@@ -167,6 +172,8 @@ impl StyleIndex {
         let mut ordinals: HashMap<String, u32> = HashMap::new();
         let mut entries = Vec::new();
         let mut by_path = HashMap::new();
+        let mut para_styles: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut char_styles: HashMap<String, Vec<usize>> = HashMap::new();
         for path in doc.para_paths(StoryRef::Body) {
             let Some(p) = doc.para(StoryRef::Body, &path) else { continue };
             let style = p.props.style.clone().unwrap_or_else(|| "Normal".to_string());
@@ -206,10 +213,18 @@ impl StyleIndex {
                 }
                 off = end;
             }
-            by_path.insert(path.clone(), entries.len());
+            let i = entries.len();
+            by_path.insert(path.clone(), i);
+            para_styles.entry(style.clone()).or_default().push(i);
+            for (cs, _) in &runs {
+                let v = char_styles.entry(cs.clone()).or_default();
+                if v.last() != Some(&i) {
+                    v.push(i);
+                }
+            }
             entries.push(Entry { path, style, text: clean(&p.plain_text()), runs, label, levels, ordinal });
         }
-        StyleIndex { entries, by_path, styles }
+        StyleIndex { entries, by_path, styles, para_styles, char_styles }
     }
 
     /// The entry of the body paragraph at `path`.
@@ -261,13 +276,53 @@ impl StyleIndex {
         }
     }
 
+    /// The entries `text_of` finds `t` in, ascending.
+    fn hits(&self, t: &Target) -> &[usize] {
+        let found = match t {
+            Target::Para(id) => self.para_styles.get(id),
+            Target::Char(id) => self.char_styles.get(id),
+        };
+        found.map_or(&[], Vec::as_slice)
+    }
+
     /// The field's result.
     pub fn eval(&self, instr: &str, at: At) -> String {
         let code = parse(instr);
         let Some(target) = self.target(&code.style) else { return NO_TEXT.to_string() };
         let n = self.entries.len();
-        // Candidates in search order, with whether each one counts as below the field (lazy:
-        // headers evaluate this for every page on every pass).
+        let hits = self.hits(&target);
+        // The first in the search order of `eval_scan`, found by binary search: headers
+        // evaluate this for every page on every pass, so it mustn't walk the body (WC-26).
+        let found = match at {
+            At::Page { first, last } => {
+                let on = match last {
+                    Some(l) if first <= l => {
+                        let end = l.min(n.saturating_sub(1)).saturating_add(1);
+                        if code.last { last_in(hits, first, end) } else { first_in(hits, first, end) }
+                    }
+                    _ => None,
+                };
+                let after = last.map_or(first, |l| l.saturating_add(1));
+                on.map(|i| (i, true))
+                    .or_else(|| last_in(hits, 0, first.min(n)).map(|i| (i, false)))
+                    .or_else(|| first_in(hits, after, n).map(|i| (i, true)))
+            }
+            At::Body(i) => last_in(hits, 0, i.min(n.saturating_sub(1)).saturating_add(1))
+                .map(|k| (k, false))
+                .or_else(|| first_in(hits, i.saturating_add(1), n).map(|k| (k, true))),
+        };
+        let found = found.and_then(|(i, below)| self.text_of(i, &target).map(|t| (i, t, below)));
+        self.result(&code, found)
+    }
+
+    /// [`StyleIndex::eval`] by walking the candidates in search order: the reference the
+    /// binary search must agree with.
+    #[cfg(test)]
+    pub(crate) fn eval_scan(&self, instr: &str, at: At) -> String {
+        let code = parse(instr);
+        let Some(target) = self.target(&code.style) else { return NO_TEXT.to_string() };
+        let n = self.entries.len();
+        // Candidates in search order, with whether each one counts as below the field.
         let order: Box<dyn Iterator<Item = (usize, bool)>> = match at {
             At::Page { first, last } => {
                 let on = match last {
@@ -280,9 +335,13 @@ impl StyleIndex {
             }
             At::Body(i) => Box::new((0..=i.min(n.saturating_sub(1))).rev().map(|k| (k, false)).chain((i.saturating_add(1)..n).map(|k| (k, true)))),
         };
-        let Some((i, text, below)) = order.into_iter().find_map(|(i, below)| self.text_of(i, &target).map(|t| (i, t, below))) else {
-            return NO_TEXT.to_string();
-        };
+        let found = order.into_iter().find_map(|(i, below)| self.text_of(i, &target).map(|t| (i, t, below)));
+        self.result(&code, found)
+    }
+
+    /// The result for the paragraph found: entry `i`, its text and whether it is below the field.
+    fn result(&self, code: &StyleRefCode, found: Option<(usize, String, bool)>) -> String {
+        let Some((i, text, below)) = found else { return NO_TEXT.to_string() };
         let Some(e) = self.entries.get(i) else { return NO_TEXT.to_string() };
         let mut out = match code.number {
             Number::Text if code.position => String::new(),
@@ -312,6 +371,17 @@ impl StyleIndex {
         }
         out
     }
+}
+
+/// The first of the ascending `hits` in `a..b`.
+fn first_in(hits: &[usize], a: usize, b: usize) -> Option<usize> {
+    hits.get(hits.partition_point(|h| *h < a)).copied().filter(|h| *h < b)
+}
+
+/// The last of the ascending `hits` in `a..b`.
+fn last_in(hits: &[usize], a: usize, b: usize) -> Option<usize> {
+    let k = hits.partition_point(|h| *h < b).checked_sub(1)?;
+    hits.get(k).copied().filter(|h| *h >= a)
 }
 
 /// The number part of a label (`Chapter 2.` → `2`).

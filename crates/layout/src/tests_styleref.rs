@@ -175,3 +175,80 @@ fn body_edits_keep_styleref_headers_cached() {
     assert_eq!(shown(&edited.pages[2].header), ["The Middles", "above"]);
     assert_eq!(shown(&edited.pages[0].header), ["Beginnings", "below"]);
 }
+
+/// WC-26: the binary search over each style's paragraphs finds what walking the body in search
+/// order finds, for every place a field can be (pages with and without body paragraphs, past
+/// the end, body paragraphs) and every kind of target.
+#[test]
+fn indexed_search_matches_the_walk() {
+    use styleref::At;
+    let styles = ["Heading1", "Normal", "Heading2", "Normal", "Normal", "Heading1", "Heading2", "Normal", "Heading2"];
+    let mut paras: Vec<(&str, String, bool)> = Vec::new();
+    let mut seed = 7u32;
+    for i in 0..40 {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let style = styles[(seed >> 16) as usize % styles.len()];
+        paras.push((style, format!("Para {i} text"), i % 5 == 0));
+    }
+    let refs: Vec<(&str, &str, bool)> = paras.iter().map(|(s, t, b)| (*s, t.as_str(), *b)).collect();
+    let mut d = doc(&refs, &[]);
+    for i in [3usize, 4, 17, 30, 31, 39] {
+        d.format_range(&Pos::body(i, 0), &Pos::body(i, 4), &|c: &mut CharProps| c.style = Some("Strong".into())).unwrap();
+    }
+    let ix = styleref::StyleIndex::build(&d);
+    let codes = [
+        r#"STYLEREF "Heading 1""#,
+        r#"STYLEREF "Heading 1" \l"#,
+        r#"STYLEREF "Heading 2" \p"#,
+        r#"STYLEREF "Heading 2" \l \p \n"#,
+        r#"STYLEREF Normal \s"#,
+        r#"STYLEREF Strong"#,
+        r#"STYLEREF Strong \l \p"#,
+        r#"STYLEREF "Heading 3""#,
+        r#"STYLEREF "No Such Style""#,
+        "STYLEREF 1",
+        "STYLEREF 2 \\l",
+        "STYLEREF 12",
+    ];
+    let n = refs.len();
+    let mut places = vec![At::Body(usize::MAX), At::Page { first: usize::MAX, last: None }, At::Page { first: 3, last: Some(usize::MAX) }];
+    for first in 0..=n + 2 {
+        places.push(At::Body(first));
+        places.push(At::Page { first, last: None });
+        for last in 0..=n + 2 {
+            places.push(At::Page { first, last: Some(last) });
+        }
+    }
+    for code in codes {
+        for at in &places {
+            assert_eq!(ix.eval(code, *at), ix.eval_scan(code, *at), "{code} at {at:?}");
+        }
+    }
+    // The search does find things (the comparison isn't all errors).
+    assert_ne!(ix.eval("STYLEREF Strong", At::Page { first: 10, last: Some(14) }), styleref::NO_TEXT);
+}
+
+/// WC-26: a header STYLEREF no longer walks the body for every field on every page: hundreds
+/// of fields looking for an unused style, on each of hundreds of pages of a long body.
+#[test]
+fn many_header_stylerefs_over_a_long_body_are_fast() {
+    use styleref::At;
+    let mut d = Document::from_text(&vec!["Body text."; 50_000].join("\n"));
+    let num = d.numbering.add_list(ListKind::Numbered);
+    for i in (0..50_000).step_by(1000) {
+        let p = d.para_mut(StoryRef::Body, &Path::top(i)).unwrap();
+        p.props.style = Some("Heading1".into());
+        p.props.numbering = Some(NumRef { num, level: 0 });
+    }
+    let ix = styleref::StyleIndex::build(&d);
+    let t = std::time::Instant::now();
+    for page in 0..500usize {
+        let at = At::Page { first: page * 100, last: Some(page * 100 + 99) };
+        for _ in 0..400 {
+            assert_eq!(ix.eval(r#"STYLEREF "Heading 3""#, at), styleref::NO_TEXT);
+        }
+        assert_eq!(ix.eval(r#"STYLEREF "Heading 1" \n"#, at), (page / 10 + 1).to_string(), "page {page}");
+    }
+    let took = t.elapsed();
+    assert!(took < std::time::Duration::from_secs(5), "200,000 evaluations took {took:?}");
+}
