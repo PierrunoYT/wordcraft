@@ -149,7 +149,15 @@ pub fn decode_font_file(bytes: &[u8]) -> Result<Vec<u8>, UserFontError> {
     }
     let decoded = match sniff(bytes).ok_or(UserFontError::NotAFont)? {
         FontFormat::TrueType | FontFormat::OpenType | FontFormat::Collection => return Ok(bytes.to_vec()),
-        FontFormat::Woff => unwrap_web_font(|| wuff::decompress_woff1(bytes))?,
+        FontFormat::Woff => {
+            // The decoder reserves each table's stated size before inflating it: check the
+            // directory's sizes first, so a few bytes can't claim gigabytes (WC-07).
+            let size = woff1_sfnt_size(bytes).ok_or_else(|| UserFontError::BadWebFont("its table directory is cut off".into()))?;
+            if size > MAX_DECODED_BYTES as u64 {
+                return Err(UserFontError::TooLarge { bytes: usize::try_from(size).unwrap_or(usize::MAX) });
+            }
+            unwrap_web_font(|| wuff::decompress_woff1(bytes))?
+        }
         FontFormat::Woff2 => unwrap_web_font(|| wuff::decompress_woff2(bytes))?,
     };
     if decoded.len() > MAX_DECODED_BYTES {
@@ -159,6 +167,27 @@ pub fn decode_font_file(bytes: &[u8]) -> Result<Vec<u8>, UserFontError> {
         Some(FontFormat::TrueType | FontFormat::OpenType | FontFormat::Collection) => Ok(decoded),
         _ => Err(UserFontError::BadWebFont("it doesn't hold a TrueType or OpenType font".into())),
     }
+}
+
+/// The most bytes unwrapping the WOFF 1.0 file `bytes` can produce, from its header and table
+/// directory alone (WOFF 1.0 §4–5): the larger of the header's `totalSfntSize` and the sfnt
+/// header, its directory and every table padded to four bytes. A table counts its stored length
+/// when that is the larger (the decoder copies a stored table whole). `None` when the header or
+/// directory is cut off.
+fn woff1_sfnt_size(bytes: &[u8]) -> Option<u64> {
+    let be16 = |at: usize| bytes.get(at..at.checked_add(2)?).and_then(|s| s.try_into().ok()).map(u16::from_be_bytes);
+    let be32 = |at: usize| bytes.get(at..at.checked_add(4)?).and_then(|s| s.try_into().ok()).map(u32::from_be_bytes);
+    const HEADER: usize = 44;
+    const ENTRY: usize = 20;
+    let tables = usize::from(be16(12)?);
+    let total_sfnt_size = u64::from(be32(16)?);
+    let mut size = 12u64.saturating_add(16u64.saturating_mul(tables as u64));
+    for i in 0..tables {
+        let entry = HEADER.checked_add(i.checked_mul(ENTRY)?)?;
+        let (comp, orig) = (u64::from(be32(entry.checked_add(8)?)?), u64::from(be32(entry.checked_add(12)?)?));
+        size = size.saturating_add(comp.max(orig).saturating_add(3) & !3);
+    }
+    Some(size.max(total_sfnt_size))
 }
 
 /// Run a WOFF/WOFF2 decoder. The decoder checks its input, but it is third-party code reading
@@ -663,6 +692,61 @@ mod tests {
             assert_eq!(face.family, FAMILY);
             assert!(face.glyph_for('g') != 0);
         }
+    }
+
+    /// A WOFF 1.0 file whose `tables` (tag, origLength) all point at one tiny zlib stream and
+    /// whose header claims `total_sfnt_size`.
+    fn woff1_claiming(tables: &[([u8; 4], u32)], total_sfnt_size: u32) -> Vec<u8> {
+        // zlib of no bytes at all.
+        let z: &[u8] = &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let body = 44 + 20 * tables.len();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"wOFF");
+        out.extend_from_slice(&[0, 1, 0, 0]);
+        out.extend_from_slice(&((body + z.len()) as u32).to_be_bytes());
+        out.extend_from_slice(&(tables.len() as u16).to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&total_sfnt_size.to_be_bytes());
+        out.extend_from_slice(&[0, 1, 0, 0]);
+        out.extend_from_slice(&[0; 20]);
+        for (tag, orig) in tables {
+            out.extend_from_slice(tag);
+            out.extend_from_slice(&(body as u32).to_be_bytes());
+            out.extend_from_slice(&(z.len() as u32).to_be_bytes());
+            out.extend_from_slice(&orig.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+        }
+        out.extend_from_slice(z);
+        out
+    }
+
+    #[test]
+    fn woff1_sizes_are_checked_before_unwrapping() {
+        // WC-07: one table claiming 2 GB, behind a few bytes of zlib, is refused from its
+        // directory, before the decoder reserves anything.
+        let start = std::time::Instant::now();
+        let huge = woff1_claiming(&[(*b"head", 0x8000_0000)], 1024);
+        assert!(
+            matches!(decode_font_file(&huge), Err(UserFontError::TooLarge { bytes }) if bytes > MAX_DECODED_BYTES),
+            "{:?}",
+            decode_font_file(&huge)
+        );
+        // Tables each under the cap that add up to more than it.
+        let parts: Vec<([u8; 4], u32)> = (0..4u8).map(|i| ([b't', b'a', b'b', b'0' + i], 40 << 20)).collect();
+        assert!(matches!(decode_font_file(&woff1_claiming(&parts, 1024)), Err(UserFontError::TooLarge { .. })));
+        // A header that claims more than the cap.
+        assert!(matches!(decode_font_file(&woff1_claiming(&[(*b"head", 16)], u32::MAX)), Err(UserFontError::TooLarge { .. })));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+        // A directory cut off before its last entry.
+        let mut cut = woff1_claiming(&[(*b"head", 16), (*b"name", 16)], 64);
+        cut.truncate(44 + 30);
+        assert!(matches!(decode_font_file(&cut), Err(UserFontError::BadWebFont(_))));
+        // Small claims still reach the decoder (which finds the stream too short).
+        assert!(matches!(decode_font_file(&woff1_claiming(&[(*b"head", 16)], 44)), Err(UserFontError::BadWebFont(_))));
+        // A real font still unwraps.
+        let regular = renamed("SourceSans3-Regular.ttf", FAMILY);
+        assert_eq!(woff1_sfnt_size(&woff1(&regular)), Some(regular.len() as u64));
+        assert!(decode_font_file(&woff1(&regular)).is_ok());
     }
 
     #[test]
