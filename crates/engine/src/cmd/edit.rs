@@ -392,20 +392,20 @@ fn find_opts(f: &crate::session::FindState) -> find_pattern::Opts {
 /// wildcard groups). A pattern that can match a paragraph mark (`^p`) reads runs of sibling
 /// paragraphs as one text with a mark between them; otherwise each paragraph is read alone.
 pub(crate) fn search_full(s: &Session, story: StoryRef, with_rep: bool) -> Result<Vec<Found>, CmdError> {
-    use regex_automata::{Input, meta, util::syntax};
+    use regex_automata::Input;
     let f = &s.find;
     if f.query.is_empty() {
         return Ok(Vec::new());
     }
     let opts = find_opts(f);
     let c = find_pattern::compile(&f.query, &opts).map_err(CmdError::Params)?;
-    let re = meta::Regex::builder()
-        .syntax(syntax::Config::new().case_insensitive(c.case_insensitive))
-        .configure(meta::Config::new().nfa_size_limit(Some(1 << 20)))
-        .build(&c.pattern)
-        .map_err(|e| CmdError::Params(format!("bad pattern: {e}")))?;
+    let matcher = c.matcher().map_err(CmdError::Params)?;
+    let re = &matcher.re;
     let pieces = with_rep.then(|| find_pattern::parse_replace(&f.replace, &opts));
     let paths = s.doc.para_paths(story);
+    // The whole search's worst case, before any of it runs (WC-33).
+    let bytes = paths.iter().filter_map(|path| s.doc.para(story, path)).fold(0usize, |n, p| n.saturating_add(p.text.len()).saturating_add(1));
+    matcher.check_budget(bytes).map_err(CmdError::Failed)?;
     // Paragraphs read as one text: consecutive siblings when the pattern spans paragraphs.
     let mut chunks: Vec<std::ops::Range<usize>> = Vec::new();
     for i in 0..paths.len() {

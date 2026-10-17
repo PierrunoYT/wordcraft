@@ -9,6 +9,17 @@
 //! a section ends with [`SECT_MARK`] instead (`^b`).
 
 use regex::escape;
+use regex_automata::{meta, nfa::thompson, util::syntax};
+
+/// Largest compiled pattern, in bytes of the regex engine's NFA. Not lower: a sentence searched
+/// with Ignore punctuation needs over 512 KB, `\b\w{5,20}\b` or `?{1,200}` over 256 KB. What a
+/// big pattern costs to run is bounded by [`SEARCH_BUDGET`] instead (WC-33).
+pub const NFA_LIMIT: usize = 1 << 20;
+/// Most work one search may do, in bytes of text times the pattern's NFA states: the worst case
+/// of the linear-time PikeVM the engine falls back on (about 2·10⁹ a second natively), so a hard
+/// pattern over a long document is refused up front instead of holding the session for minutes
+/// (WC-33).
+pub const SEARCH_BUDGET: u64 = 1 << 34;
 
 /// A paragraph mark in the searched text.
 pub const PARA_MARK: char = '\r';
@@ -45,6 +56,43 @@ pub struct Compiled {
     pub case_insensitive: bool,
     /// The pattern can match a paragraph mark, so the search must read across paragraphs.
     pub spans_paras: bool,
+}
+
+/// A [`Compiled`] pattern built for searching, with what each searched byte can cost.
+pub struct Matcher {
+    pub re: meta::Regex,
+    /// States of the pattern's NFA: the most a PikeVM search steps through per byte.
+    pub states: usize,
+}
+
+impl Compiled {
+    /// Build the pattern, within [`NFA_LIMIT`].
+    pub fn matcher(&self) -> Result<Matcher, String> {
+        let syntax = syntax::Config::new().case_insensitive(self.case_insensitive);
+        let too_big = || format!("the Find what pattern is too complex (shorten repetitions such as {{1,500}}); its limit is {} KB", NFA_LIMIT >> 10);
+        let re = meta::Regex::builder()
+            .syntax(syntax)
+            .configure(meta::Config::new().nfa_size_limit(Some(NFA_LIMIT)))
+            .build(&self.pattern)
+            .map_err(|e| if e.size_limit().is_some() { too_big() } else { format!("bad pattern: {e}") })?;
+        let nfa = thompson::Compiler::new()
+            .syntax(syntax)
+            .configure(thompson::Config::new().nfa_size_limit(Some(NFA_LIMIT)))
+            .build(&self.pattern)
+            .map_err(|_| too_big())?;
+        Ok(Matcher { re, states: nfa.states().len() })
+    }
+}
+
+impl Matcher {
+    /// Refuse a search over `bytes` of text whose worst case is over [`SEARCH_BUDGET`].
+    pub fn check_budget(&self, bytes: usize) -> Result<(), String> {
+        let work = u64::try_from(bytes).unwrap_or(u64::MAX).saturating_mul(u64::try_from(self.states.max(1)).unwrap_or(u64::MAX));
+        if work > SEARCH_BUDGET {
+            return Err("the Find what pattern is too complex to search a document this long: simplify it (shorter repetitions, fewer \\b)".into());
+        }
+        Ok(())
+    }
 }
 
 /// What a `^` code stands for in Find what.
@@ -414,4 +462,59 @@ pub fn expand(pieces: &[Piece], found: &str, group: &dyn Fn(usize) -> Option<Str
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Session;
+    use serde_json::json;
+    use wordcraft_doc::Document;
+
+    /// WC-33: everyday Find patterns build under the NFA limit; a huge one is refused.
+    #[test]
+    fn everyday_patterns_fit_the_nfa_limit() {
+        let o = Opts::default();
+        let long = "abcdefghij".repeat(100);
+        let phrase = "the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog";
+        for (q, o) in [
+            ("hello", o),
+            (long.as_str(), o),
+            ("Hello", Opts { whole_word: true, ..o }),
+            (phrase, Opts { ignore_punct: true, ignore_space: true, ..o }),
+            ("<[A-Z][a-z]@>", Opts { wildcards: true, ..o }),
+            ("?{1,200}", Opts { wildcards: true, ..o }),
+            ("(*)@(*)", Opts { wildcards: true, ..o }),
+            (r"\b\w{5,20}\b", Opts { regex: true, ..o }),
+            (r".{0,1000}", Opts { regex: true, ..o }),
+            (r"\d{3}-\d{4}", Opts { regex: true, ..o }),
+            (r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", Opts { regex: true, ..o }),
+        ] {
+            let c = compile(q, &o).unwrap();
+            assert!(c.matcher().is_ok(), "{q}: {:?}", c.matcher().err());
+        }
+        let huge = compile(r"(?:\p{L}[^\r]{0,200}){40}", &Opts { regex: true, ..o }).unwrap();
+        let err = huge.matcher().err().unwrap();
+        assert!(err.contains("too complex"), "{err}");
+    }
+
+    /// WC-33: a pattern whose worst case over this document is beyond the budget is refused at
+    /// once, instead of running on the PikeVM (a Unicode `\b` over non-ASCII text): this 3 MB
+    /// paragraph took over ten seconds per Find before the budget.
+    #[test]
+    fn a_hard_pattern_over_a_long_document_is_refused_up_front() {
+        let line = "Съешь же ещё этих мягких французских булок да выпей чаю";
+        let long = vec![line; 30_000].join(" ");
+        let mut s = Session::new(Document::from_text(&long));
+        let hard = r"(?:[^\r]{0,99}\b){9}\p{Lu}{2}";
+        let t = std::time::Instant::now();
+        let err = s.run("edit.find", &json!({"text": hard, "regex": true, "matchCase": true})).unwrap_err().to_string();
+        assert!(err.contains("too complex"), "{err}");
+        assert!(s.run("edit.replaceAll", &json!({"text": hard, "regex": true, "matchCase": true, "with": "x"})).is_err());
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "refused up front: {:?}", t.elapsed());
+        // A simple pattern over the same document, and the hard one over a short one, still search.
+        assert_eq!(s.run("edit.find", &json!({"text": r"булок\s+да", "regex": true})).unwrap()["count"], 30_000);
+        let mut short = Session::new(Document::from_text(&vec![line; 20].join("\n")));
+        short.run("edit.find", &json!({"text": hard, "regex": true, "matchCase": true})).unwrap();
+    }
 }
