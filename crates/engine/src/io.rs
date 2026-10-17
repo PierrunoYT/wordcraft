@@ -514,8 +514,8 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
     read_file_capped(path, MAX_READ, "file")
 }
 
-/// Is there a folder at `path`? Asked within the automation read root when there is one, like a
-/// read (`false` when it isn't, or the path is refused).
+/// Is there a folder at `path`? Checked like a read first (the automation read root, network and
+/// device paths): `Err` when the path is refused, before anything is looked up.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn is_folder(path: &str) -> Result<bool, String> {
     let path = crate::file_access::checked_read(path)?;
