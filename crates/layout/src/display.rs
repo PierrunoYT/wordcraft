@@ -1,5 +1,8 @@
 //! Page → draw items, shared by the raster renderer, the PDF exporter and thumbnails.
 
+use std::cell::OnceCell;
+use std::collections::HashMap;
+
 use wordcraft_doc::graphic::{Graphic, GraphicItem, GraphicKind, PathSeg, TextAlign};
 use wordcraft_doc::para::{InlineObject, ShapeKind};
 use wordcraft_doc::props::{Border, BorderStyle, Rgb, TextColor, TextDirection, Underline};
@@ -344,6 +347,7 @@ fn stroke_of(u: Underline) -> Stroke {
 /// Draw items for a page.
 pub fn page_display(doc: &Document, page: &Page, opts: &DisplayOptions) -> Vec<Draw> {
     let mut out = Vec::new();
+    let au = Authors::new(doc);
     let ha = if opts.dim_header { 0.45 } else { 1.0 };
     let ba = if opts.dim_body { 0.45 } else { 1.0 };
     for (items, a) in [(&page.header, ha), (&page.footer, ha), (&page.items, ba)] {
@@ -355,7 +359,7 @@ pub fn page_display(doc: &Document, page: &Page, opts: &DisplayOptions) -> Vec<D
                 && let Some(rect) = cell_clip(&clips, *story, &path.0)
             {
                 let mut inner = Vec::new();
-                item(doc, it, opts, a, &mut inner);
+                item(doc, &au, it, opts, a, &mut inner);
                 out.push(Draw::Clip { rect, items: inner });
                 continue;
             }
@@ -369,10 +373,10 @@ pub fn page_display(doc: &Document, page: &Page, opts: &DisplayOptions) -> Vec<D
                     if let Some((_, rect, warp)) = warps.iter().find(|(w, ..)| w == id) {
                         let lines: Vec<&Placed> =
                             items.iter().filter(|i| matches!(i, Placed::Lines { story: StoryRef::Part(s), .. } if s == id)).collect();
-                        warped_text(doc, &lines, *rect, warp, opts, a, &mut out);
+                        warped_text(doc, &au, &lines, *rect, warp, opts, a, &mut out);
                     }
                 }
-                _ => item(doc, it, opts, a, &mut out),
+                _ => item(doc, &au, it, opts, a, &mut out),
             }
         }
     }
@@ -389,11 +393,12 @@ pub fn object_display(doc: &Document, page: &Page, o: &InlineObject, rect: Rect,
     let mut out = Vec::new();
     object_draws(o, rect, Spin::default(), 1.0, opts, &mut out);
     let Some(id) = text_box else { return out };
+    let au = Authors::new(doc);
     for items in [&page.items, &page.header, &page.footer] {
         let lines: Vec<&Placed> = items.iter().filter(|i| matches!(i, Placed::Lines { story: StoryRef::Part(s), .. } if *s == id)).collect();
         match warped_boxes(doc, items).into_iter().find(|(w, ..)| *w == id) {
-            Some((_, rect, warp)) if !lines.is_empty() => warped_text(doc, &lines, rect, &warp, opts, 1.0, &mut out),
-            _ => lines.into_iter().for_each(|it| item(doc, it, opts, 1.0, &mut out)),
+            Some((_, rect, warp)) if !lines.is_empty() => warped_text(doc, &au, &lines, rect, &warp, opts, 1.0, &mut out),
+            _ => lines.into_iter().for_each(|it| item(doc, &au, it, opts, 1.0, &mut out)),
         }
     }
     out
@@ -440,6 +445,7 @@ fn warped_boxes(doc: &Document, items: &[Placed]) -> Vec<(u32, Rect, wordcraft_d
 /// other decorations are left out; a warp that is drawn flat leaves the text as it is.
 fn warped_text(
     doc: &Document,
+    au: &Authors,
     lines: &[&Placed],
     rect: Rect,
     warp: &wordcraft_doc::wordart::TextWarp,
@@ -449,7 +455,7 @@ fn warped_text(
 ) {
     let mut raw = Vec::new();
     for it in lines {
-        item(doc, it, opts, alpha, &mut raw);
+        item(doc, au, it, opts, alpha, &mut raw);
     }
     // The letters: runs with effects as they are, plain runs from their glyphs.
     let mut arts: Vec<(BezPath, Box<wordcraft_doc::wordart::TextEffects>, Rgb, f32)> = Vec::new();
@@ -568,13 +574,13 @@ fn char_box(b: &Border, x0: f32, x1: f32, top: f32, bottom: f32, alpha: f32, out
     out.push(rule(r, top, r, bottom, b, alpha));
 }
 
-fn item(doc: &Document, it: &Placed, opts: &DisplayOptions, alpha: f32, out: &mut Vec<Draw>) {
-    item_in(doc, it, opts, alpha, Spin::default(), out)
+fn item(doc: &Document, au: &Authors, it: &Placed, opts: &DisplayOptions, alpha: f32, out: &mut Vec<Draw>) {
+    item_in(doc, au, it, opts, alpha, Spin::default(), out)
 }
 
 /// [`item`] drawn inside the turn `outer` (a turned Drawing Canvas's members): a shape's
 /// effects follow all the turns it is drawn inside.
-fn item_in(doc: &Document, it: &Placed, opts: &DisplayOptions, alpha: f32, outer: Spin, out: &mut Vec<Draw>) {
+fn item_in(doc: &Document, au: &Authors, it: &Placed, opts: &DisplayOptions, alpha: f32, outer: Spin, out: &mut Vec<Draw>) {
     match it {
         Placed::Fill { rect, color } => out.push(Draw::Fill { rect: *rect, color: *color, alpha, text_bg: false }),
         Placed::Rule { x0, y0, x1, y1, border } => out.push(rule(*x0, *y0, *x1, *y1, border, alpha)),
@@ -591,14 +597,14 @@ fn item_in(doc: &Document, it: &Placed, opts: &DisplayOptions, alpha: f32, outer
         Placed::Clip { rect, spin, items } => {
             let mut inner = Vec::new();
             for it in items {
-                item_in(doc, it, opts, alpha, spin.within(outer), &mut inner);
+                item_in(doc, au, it, opts, alpha, spin.within(outer), &mut inner);
             }
             spun(*spin, *rect, vec![Draw::Clip { rect: *rect, items: inner }], out)
         }
         Placed::Cell { .. } | Placed::Object { .. } => {}
         Placed::Lines { story, path, para, l0, l1, x, y, turn } if turn.is_turned() => {
             let mut items = Vec::new();
-            lines(doc, *story, path, para, *l0, *l1, 0.0, 0.0, opts, alpha, &mut items);
+            lines(doc, au, *story, path, para, *l0, *l1, 0.0, 0.0, opts, alpha, &mut items);
             // Link areas are axis-aligned page rectangles: turned text gets none.
             for d in &mut items {
                 if let Draw::Glyphs { link, .. } = d {
@@ -610,12 +616,13 @@ fn item_in(doc: &Document, it: &Placed, opts: &DisplayOptions, alpha: f32, outer
             }
             out.push(Draw::Turned { x: *x, y: *y, turn: *turn, items });
         }
-        Placed::Lines { story, path, para, l0, l1, x, y, .. } => lines(doc, *story, path, para, *l0, *l1, *x, *y, opts, alpha, out),
+        Placed::Lines { story, path, para, l0, l1, x, y, .. } => lines(doc, au, *story, path, para, *l0, *l1, *x, *y, opts, alpha, out),
     }
 }
 
 fn lines(
     doc: &Document,
+    au: &Authors,
     story: StoryRef,
     path: &Path,
     pl: &ParaLayout,
@@ -839,7 +846,7 @@ fn lines(
             let shown = opts.markup && m.insertions_deletions;
             let del = rc.del.filter(|_| shown);
             let ins = rc.ins.filter(|_| shown && del.is_none());
-            let author = |r: u32| revision_color(doc.revisions.get(r as usize).map(|v| author_index(doc, &v.author)).unwrap_or(0));
+            let author = |r: u32| au.color(r);
             // Moved text: green, double strikethrough where it was, double underline where it went.
             let moved_to = doc.move_name(ins).is_some();
             let moved_from = del.is_some() && doc.move_name(del).is_some();
@@ -1136,14 +1143,8 @@ fn lines(
                 let m = &opts.revisions;
                 let color = para.filter(|_| opts.markup && m.insertions_deletions).and_then(|p| match (p.mark.ins, p.mark.del) {
                     (ins, del) if doc.move_name(del).is_some() || (del.is_none() && doc.move_name(ins).is_some()) => Some(MOVE_COLOR),
-                    (_, Some(r)) => Some(
-                        m.delete_color
-                            .unwrap_or_else(|| revision_color(doc.revisions.get(r as usize).map(|v| author_index(doc, &v.author)).unwrap_or(0))),
-                    ),
-                    (Some(r), None) => Some(
-                        m.insert_color
-                            .unwrap_or_else(|| revision_color(doc.revisions.get(r as usize).map(|v| author_index(doc, &v.author)).unwrap_or(0))),
-                    ),
+                    (_, Some(r)) => Some(m.delete_color.unwrap_or_else(|| au.color(r))),
+                    (Some(r), None) => Some(m.insert_color.unwrap_or_else(|| au.color(r))),
                     _ => None,
                 });
                 // The last paragraph of a section ends in a section break instead of a plain ¶.
@@ -1521,14 +1522,39 @@ fn text_glyphs(doc: &Document, r: Rect, it: &GraphicItem, alpha: f32, k: f32) ->
     })
 }
 
-fn author_index(doc: &Document, author: &str) -> u32 {
-    let mut seen: Vec<&str> = Vec::new();
-    for r in &doc.revisions {
-        if !seen.contains(&r.author.as_str()) {
-            seen.push(&r.author);
-        }
+/// The revision authors in order of first appearance, for their colours: built once per drawing
+/// and only when a tracked change is drawn, not per tracked run (WC-10).
+pub(crate) struct Authors<'a> {
+    doc: &'a Document,
+    /// Each revision's author index.
+    of_revision: OnceCell<Vec<u32>>,
+}
+
+impl<'a> Authors<'a> {
+    pub(crate) fn new(doc: &'a Document) -> Self {
+        Authors { doc, of_revision: OnceCell::new() }
     }
-    seen.iter().position(|a| *a == author).unwrap_or(0) as u32
+
+    /// The author index of revision `r` (0 for an unknown revision).
+    pub(crate) fn index(&self, r: u32) -> u32 {
+        let ix = self.of_revision.get_or_init(|| {
+            let mut first: HashMap<&str, u32> = HashMap::new();
+            self.doc
+                .revisions
+                .iter()
+                .map(|v| {
+                    let next = first.len() as u32;
+                    *first.entry(v.author.as_str()).or_insert(next)
+                })
+                .collect()
+        });
+        usize::try_from(r).ok().and_then(|r| ix.get(r)).copied().unwrap_or(0)
+    }
+
+    /// The colour of revision `r`'s author.
+    fn color(&self, r: u32) -> Rgb {
+        revision_color(self.index(r))
+    }
 }
 
 /// Automatic colour is black, or white on a dark background.

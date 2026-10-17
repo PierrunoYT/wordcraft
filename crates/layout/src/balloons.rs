@@ -13,7 +13,7 @@
 //! are clipped to the page, and when a page has more comments than its markup area can hold the
 //! ones that find no room are left out.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use wordcraft_doc::para::InlineObject;
 use wordcraft_doc::props::{Border, BorderStyle, CharProps, Rgb, TextColor};
@@ -103,15 +103,15 @@ pub fn replies(doc: &Document) -> BTreeMap<u32, Vec<u32>> {
     m
 }
 
-/// The comment authors in order of first appearance (for their colours).
-fn author_index(doc: &Document, author: &str) -> u32 {
-    let mut seen: Vec<&str> = Vec::new();
+/// The comment authors' indices in order of first appearance (for their colours): built once
+/// per layout, not per comment (WC-10).
+pub(crate) fn author_indices(doc: &Document) -> HashMap<&str, u32> {
+    let mut m: HashMap<&str, u32> = HashMap::new();
     for c in doc.comments.values() {
-        if !seen.contains(&c.author.as_str()) {
-            seen.push(&c.author);
-        }
+        let next = m.len() as u32;
+        m.entry(c.author.as_str()).or_insert(next);
     }
-    seen.iter().position(|a| *a == author).unwrap_or(0) as u32
+    m
 }
 
 fn author_name(a: &str) -> &str {
@@ -129,13 +129,14 @@ pub(crate) fn add(ctx: &mut Ctx, lay: &mut DocLayout) {
         return;
     }
     let threads = replies(doc);
+    let authors = author_indices(doc);
     let card_w = MARKUP_AREA - 2.0 * SIDE;
     let inner = card_w - STRIPE - 2.0 * PAD;
     let mut cards: Vec<Card> = Vec::new();
     for (id, pos) in anchors {
         let Some(caret) = lay.caret_on(&pos, 0) else { continue };
         let Some(c) = doc.comments.get(&id) else { continue };
-        let color = revision_color(author_index(doc, &c.author));
+        let color = revision_color(authors.get(c.author.as_str()).copied().unwrap_or(0));
         let mut thread = vec![id];
         thread.extend(threads.get(&id).into_iter().flatten().copied());
         let x = STRIPE + PAD;

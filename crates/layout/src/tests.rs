@@ -1432,6 +1432,78 @@ fn a_tracked_paragraph_mark_shows_in_its_authors_colour() {
     assert_eq!(marks(false), [None, None]);
 }
 
+/// WC-10: revision authors are numbered by first appearance (an unknown revision is author 0),
+/// and comment authors likewise.
+#[test]
+fn author_indices_follow_first_appearance() {
+    let mut d = Document::new();
+    for a in ["Ana", "Ben", "Ana", "", "Cy", "Ben"] {
+        d.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Insert, a, ""));
+    }
+    let au = display::Authors::new(&d);
+    assert_eq!((0..8).map(|r| au.index(r)).collect::<Vec<_>>(), [0, 1, 0, 2, 3, 1, 0, 0]);
+    assert_eq!(au.index(u32::MAX), 0);
+    for (id, a) in ["Cy", "Ana", "Cy", "Ben"].iter().enumerate() {
+        d.comments.insert(id as u32, wordcraft_doc::Comment { author: (*a).into(), ..Default::default() });
+    }
+    let ix = balloons::author_indices(&d);
+    assert_eq!((ix["Cy"], ix["Ana"], ix["Ben"], ix.len()), (0, 1, 2, 3));
+}
+
+/// WC-10: the author index is built once per page, not per tracked run: 20,000 revisions by
+/// distinct authors with hundreds of tracked runs on the page took minutes to paint.
+#[test]
+fn many_revision_authors_paint_quickly_in_their_colours() {
+    const REVS: u32 = 20_000;
+    const RUNS: usize = 600;
+    let mut d = Document::from_text(&"ab ".repeat(RUNS));
+    for r in 0..REVS {
+        d.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Insert, format!("Author {r}"), ""));
+    }
+    for k in 0..RUNS {
+        let r = REVS - 1 - k as u32;
+        d.format_range(&Pos::body(0, 3 * k), &Pos::body(0, 3 * k + 2), &|c| c.ins = Some(r)).unwrap();
+    }
+    let l = lay(&d);
+    let opts = display::DisplayOptions { markup: true, ..Default::default() };
+    let t = std::time::Instant::now();
+    let draws: Vec<display::Draw> = l.pages.iter().flat_map(|p| display::page_display(&d, p, &opts)).collect();
+    let took = t.elapsed();
+    assert!(took < std::time::Duration::from_secs(5), "painting took {took:?}");
+    // Each run in its own author's colour: the last authors' indices are their revision ids.
+    assert_eq!(display::Authors::new(&d).index(REVS - 1), REVS - 1);
+    let colors: Vec<wordcraft_doc::props::Rgb> =
+        draws.iter().filter_map(|i| if let display::Draw::Glyphs { color, .. } = i { Some(*color) } else { None }).collect();
+    for i in 0..6 {
+        assert!(colors.contains(&display::revision_color(i)), "author colour {i} missing");
+    }
+}
+
+/// WC-10: comment balloon colours come from an author index built once, not per balloon:
+/// 20,000 comment authors and hundreds of balloons took minutes to lay out.
+#[test]
+fn many_comment_authors_lay_out_balloons_quickly() {
+    const BALLOONS: usize = 200;
+    let mut d = Document::from_text(&"word ".repeat(BALLOONS));
+    // From the end, so the anchors don't move the offsets still to come.
+    for k in (0..BALLOONS).rev() {
+        comment_on(&mut d, 0, 5 * k, 5 * k + 4, &format!("Reviewer {k}"), "Note", None);
+    }
+    // Unanchored comments by other authors still count for the colours.
+    let part = d.add_part(wordcraft_doc::PartKind::Comment, vec![wordcraft_doc::para_block(Paragraph::with_text("x", CharProps::default()))]);
+    let base = d.comments.len() as u32;
+    for k in 0..20_000u32 {
+        d.comments.insert(base + k, wordcraft_doc::Comment { author: format!("Other {k}"), part, ..Default::default() });
+    }
+    let t = std::time::Instant::now();
+    let l = balloon_layout(&d);
+    let took = t.elapsed();
+    assert!(took < std::time::Duration::from_secs(10), "layout took {took:?}");
+    assert!(l.pages.iter().all(|p| p.markup == balloons::MARKUP_AREA));
+    let ix = balloons::author_indices(&d);
+    assert_eq!((ix["Reviewer 199"], ix["Reviewer 0"], ix["Other 19999"]), (0, BALLOONS as u32 - 1, BALLOONS as u32 + 19_999));
+}
+
 #[test]
 fn section_breaks_show_with_formatting_marks() {
     use wordcraft_doc::section::{SectionProps, SectionStart};
