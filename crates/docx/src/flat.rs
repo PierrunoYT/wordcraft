@@ -9,7 +9,7 @@
 //! or not (a repeated name), data is checked before it's copied, and nesting and elements are
 //! capped as the XML tree reader caps a part's.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use base64::Engine as _;
 use quick_xml::events::{BytesStart, Event};
@@ -339,22 +339,35 @@ fn with_scope(frag: &[u8], scope: &[Vec<(String, String)>]) -> Vec<u8> {
     }
     let rest = frag.get(open..).unwrap_or_default();
     let name_end = rest.iter().position(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/').unwrap_or(rest.len());
-    let tag_end = rest.iter().position(|b| *b == b'>').unwrap_or(rest.len());
-    let tag = rest.get(..tag_end).unwrap_or_default();
+    // The root's own declarations, read once (not searched for once per inherited one).
+    let own = root_ns_names(rest);
     let mut out = Vec::with_capacity(rest.len() + 256);
     out.extend_from_slice(rest.get(..name_end).unwrap_or_default());
     // Innermost declarations win: walk from the data element out, skipping prefixes seen.
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     for (k, v) in decls.iter().rev() {
-        let declared = tag.windows(k.len() + 1).any(|w| w.get(..k.len()) == Some(k.as_bytes()) && matches!(w.last(), Some(b'=' | b' ')));
-        if declared || seen.contains(&k.as_str()) {
+        if own.contains(k.as_bytes()) || !seen.insert(k.as_str()) {
             continue;
         }
-        seen.push(k);
         out.extend_from_slice(format!(" {k}=\"{v}\"").as_bytes());
     }
     out.extend_from_slice(rest.get(name_end..).unwrap_or_default());
     out
+}
+
+/// The `xmlns` / `xmlns:p` attribute names on the start tag `tag` begins with, in one pass.
+fn root_ns_names(tag: &[u8]) -> HashSet<Vec<u8>> {
+    let mut r = quick_xml::Reader::from_reader(tag);
+    match r.read_event() {
+        Ok(Event::Start(e) | Event::Empty(e)) => e
+            .attributes()
+            .with_checks(false)
+            .flatten()
+            .map(|a| a.key.as_ref().to_vec())
+            .filter(|k| k.as_slice() == b"xmlns" || k.starts_with(b"xmlns:"))
+            .collect(),
+        _ => HashSet::new(),
+    }
 }
 
 /// Offset of the `<` of the first element in `frag` (after whitespace, comments and processing
@@ -461,6 +474,20 @@ mod tests {
         let own = b"<w:document xmlns:w=\"urn:own\"/>";
         assert_eq!(with_scope(own, &scope), own.to_vec());
         assert_eq!(with_scope(b"no element", &scope), b"no element".to_vec());
+    }
+
+    /// WC-24: the root's own declarations are read once, not searched for once per inherited
+    /// declaration, so hundreds of those against a root tag with a huge attribute list stay linear.
+    #[test]
+    fn inherited_namespaces_against_a_huge_root_tag() {
+        let scope: Vec<Vec<(String, String)>> =
+            (0..3).map(|l| (0..256).map(|i| (format!("xmlns:p{l}_{i}"), format!("urn:{l}:{i}"))).collect()).collect();
+        let attrs: String = (0..100_000).map(|i| format!(" a{i}=\"x\"")).collect();
+        let frag = format!("<w:document xmlns:p0_0 = \"urn:own\"{attrs}><w:body/></w:document>");
+        let out = String::from_utf8(with_scope(frag.as_bytes(), &scope)).unwrap();
+        assert_eq!(out.matches("xmlns:p").count(), 3 * 256, "every prefix once");
+        assert!(out.contains("xmlns:p0_0 = \"urn:own\"") && !out.contains("urn:0:0\""));
+        assert!(out.contains("xmlns:p2_255=\"urn:2:255\"") && out.ends_with("<w:body/></w:document>"));
     }
 
     #[test]
