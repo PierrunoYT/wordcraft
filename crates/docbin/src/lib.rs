@@ -348,7 +348,16 @@ struct ParaBuild {
 
 impl ParaBuild {
     fn push(&mut self, c: char, props: CharProps) {
-        let len = c.len_utf8();
+        self.push_str(c.encode_utf8(&mut [0; 4]), props);
+    }
+
+    /// Append `s` with one set of properties: one comparison with the current run, not one
+    /// per character.
+    fn push_str(&mut self, s: &str, props: CharProps) {
+        if s.is_empty() {
+            return;
+        }
+        let len = s.len();
         match &self.cur {
             Some(p) if *p == props => {
                 if let Some(r) = self.runs.last_mut() {
@@ -360,7 +369,19 @@ impl ParaBuild {
                 self.cur = Some(props);
             }
         }
-        self.text.push(c);
+        self.text.push_str(s);
+    }
+}
+
+/// Take `n` from the walk budget; false (and nothing taken) when less than that is left.
+fn charge(budget: &std::cell::Cell<u64>, n: usize) -> bool {
+    let n = n as u64;
+    match budget.get().checked_sub(n) {
+        Some(left) => {
+            budget.set(left);
+            true
+        }
+        None => false,
     }
 }
 
@@ -487,7 +508,7 @@ fn walk(ctx: &WalkCtx, cp_start: u32, cp_end: u32, pics: &mut media::Pictures) -
                         f.depth -= 1;
                         field = Some(f);
                     } else {
-                        finish_field(&mut pb, f);
+                        finish_field(&mut pb, f, ctx.budget);
                     }
                 }
                 cp = cp.saturating_add(1);
@@ -561,19 +582,38 @@ struct FieldBuild {
     sep: Option<Vec<(char, CharProps)>>,
 }
 
-/// Emit a finished field: HYPERLINK keeps its result text as a linked run; every other
+/// Longest field instruction kept (bytes); the rest of a longer one is dropped. Real
+/// instructions (a URL, a switch or two) are far shorter.
+const MAX_FIELD_INSTR: usize = 8 << 10;
+
+/// Emit a finished field: HYPERLINK keeps its result text as linked runs; every other
 /// field becomes one inline object with its cached result.
-fn finish_field(pb: &mut ParaBuild, f: FieldBuild) {
+///
+/// The link target is set once per run of equally formatted result characters, not cloned
+/// and compared per character. The first run's copy is paid for by the instruction's own
+/// characters; each further one is charged against the walk `budget`, and once that is spent
+/// the rest of the result stays unlinked text.
+fn finish_field(pb: &mut ParaBuild, f: FieldBuild, budget: &std::cell::Cell<u64>) {
     let instr = f.instr.trim().to_string();
     let result = f.sep.unwrap_or_default();
-    let result_text: String = result.iter().map(|(c, _)| *c).collect();
     if let Some(target) = hyperlink_target(&instr) {
-        for (c, mut props) in result {
-            props.link = Some(target.clone());
-            pb.push(c, props);
+        let mut rest = result.as_slice();
+        let mut first = true;
+        while let Some((_, props)) = rest.first() {
+            let n = rest.iter().take_while(|(_, p)| p == props).count().max(1);
+            let Some((run, tail)) = rest.split_at_checked(n) else { break };
+            let text: String = run.iter().map(|(c, _)| *c).collect();
+            let mut props = props.clone();
+            if first || charge(budget, target.len()) {
+                props.link = Some(target.clone());
+            }
+            first = false;
+            pb.push_str(&text, props);
+            rest = tail;
         }
         return;
     }
+    let result_text: String = result.iter().map(|(c, _)| *c).collect();
     pb.push('\u{FFFC}', CharProps::default());
     pb.objects.push(InlineObject::Field { instr, result: result_text, locked: false, dirty: false, code: false, form: String::new() });
 }
@@ -654,7 +694,11 @@ fn push_formatted(pb: &mut ParaBuild, cp: u32, c: char, ctx: &WalkCtx, field: Op
             // Inside a field, characters are recorded for the field object instead of shown;
             // `finish_field` emits the visible text (hyperlink runs or one object anchor).
             Some(result) => result.push((c, props)),
-            None => f.instr.push(c),
+            None => {
+                if f.instr.len().saturating_add(c.len_utf8()) <= MAX_FIELD_INSTR {
+                    f.instr.push(c);
+                }
+            }
         },
         None => pb.push(c, props),
     }

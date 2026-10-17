@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{grpprl, tabs_papx};
+use super::{grpprl, read, struct_doc, structured_spec, tabs_papx};
 use crate::stsh::RawStyle;
 
 /// A paragraph style.
@@ -67,4 +67,35 @@ fn style_cycles_resolve_without_looping() {
     let b = sheet.styles.get(1).expect("B");
     assert_eq!(b.chr.italic, Some(true));
     assert_eq!(sheet.styles.len(), 3);
+}
+
+/// WC-12 (#2756). A HYPERLINK's target was cloned into, and compared for, every character of
+/// its result, with neither the instruction nor the result capped below the document's whole
+/// character budget: O(target × result) bytes from one field. The instruction is now capped at
+/// 8 KB and the target is set once per run; runs past the first are charged against the walk
+/// budget, so the link bytes a file can make are bounded by its size.
+#[test]
+fn hyperlink_target_is_capped_and_set_once_per_run() {
+    let url = "a".repeat(20_000);
+    let result = "ab".repeat(20);
+    let text: &'static str = Box::leak(format!("\u{13}HYPERLINK \"http://x/{url}\"\u{14}{result}\u{15}\r").into_boxed_str());
+    let ccp = text.chars().count() as u32;
+    let start = text.chars().position(|c| c == '\u{14}').expect("separator") as u32 + 1;
+    // Every result character alternates bold on and off: one run each.
+    let mut runs = vec![(0, Vec::new())];
+    for i in 0..result.len() as u32 {
+        runs.push((start + i, grpprl(&[(0x0835, &[(i % 2) as u8])])));
+    }
+    runs.push((start + result.len() as u32, Vec::new()));
+    let spec = super::StructSpec { text, chpx_runs: runs, ..structured_spec(text, ccp) };
+    let file = struct_doc(&spec);
+    let doc = read(&file).expect("opens");
+    let p0 = doc.body.first().and_then(|b| b.as_para()).expect("para");
+    assert_eq!(p0.text, result, "the result text is all kept");
+    let links: Vec<&str> = p0.runs.iter().filter_map(|r| r.props.link.as_deref()).collect();
+    let first = links.first().expect("the first run is linked");
+    assert!(first.starts_with("http://x/aaa") && first.len() <= 8 << 10, "target capped: {} bytes", first.len());
+    let linked: usize = links.iter().map(|l| l.len()).sum();
+    assert!(linked <= 2 * file.len(), "{linked} link bytes from a {}-byte file", file.len());
+    assert!(p0.runs.len() >= result.len(), "one run per formatting change");
 }
