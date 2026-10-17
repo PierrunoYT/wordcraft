@@ -383,10 +383,13 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
         }
         if para.is_empty()
             && t.contains('|')
-            && let Some(aligns) = lines.get(i + 1).and_then(|l| delimiter_row(l))
+            && let Some(mut aligns) = lines.get(i + 1).and_then(|l| delimiter_row(l))
         {
             let head = split_row(t);
             if head.len() == aligns.len() {
+                // Columns and rows past the document's caps are dropped here, before any cell is
+                // made: padding every row to a hostile header's width took gigabytes.
+                aligns.truncate(wordcraft_doc::table::MAX_COLS);
                 let mut table = FTable::default();
                 let cell = |s: &str, header: bool, a: Option<Align>| {
                     let p = Para { align: a, inlines: parse_inlines(s, &Fmt::default(), depth), ..Default::default() };
@@ -398,9 +401,11 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
                     if is_blank(l) || !l.contains('|') || interrupts(l) {
                         break;
                     }
-                    let mut cells = split_row(l);
-                    cells.resize(aligns.len(), String::new());
-                    table.rows.push(cells.iter().zip(&aligns).map(|(s, a)| cell(s, false, *a)).collect());
+                    if table.rows.len() < wordcraft_doc::table::MAX_ROWS {
+                        let mut cells = split_row(l);
+                        cells.resize(aligns.len(), String::new());
+                        table.rows.push(cells.iter().zip(&aligns).map(|(s, a)| cell(s, false, *a)).collect());
+                    }
                     i += 1;
                 }
                 out.push(FBlock::Table(table));
@@ -1489,6 +1494,26 @@ mod tests {
         assert_eq!(escape_line_start("\tTabbed # text".to_string()), "   Tabbed # text");
         assert_eq!(escape_line_start("    # not a heading".to_string()), "   \\# not a heading");
         assert_eq!(escape_line_start(" \t1. not a list".to_string()), "   1\\. not a list");
+    }
+
+    #[test]
+    fn tables_are_capped_before_cells_are_made() {
+        // #2749: every row was padded to the header's width before the column cap applied, so a
+        // 17 KB file made over half a GB of empty cells. Rows past the cap are still the table's.
+        use wordcraft_doc::table::{MAX_COLS, MAX_ROWS};
+        let wide = format!("{}|\n{}|\n{}", "|a".repeat(50_000), "|-".repeat(50_000), "|x|\n".repeat(100));
+        let long = format!("|a|\n|-|\n{}", "|x|\n".repeat(MAX_ROWS + 100));
+        let flow = parse(&format!("{wide}\n{long}after\n"));
+        assert_eq!(flow.blocks.len(), 3);
+        let FBlock::Table(t) = &flow.blocks[0] else { panic!("expected table") };
+        assert_eq!(t.rows.len(), 101);
+        assert!(t.rows.iter().all(|r| r.len() == MAX_COLS));
+        assert_eq!(t.rows[1][0].text(), "x");
+        let FBlock::Table(t) = &flow.blocks[1] else { panic!("expected table") };
+        assert_eq!(t.rows.len(), MAX_ROWS);
+        assert!(t.rows.iter().all(|r| r.len() == 1));
+        let FBlock::Para(p) = &flow.blocks[2] else { panic!("expected paragraph") };
+        assert_eq!(p.text(), "after");
     }
 
     #[test]
