@@ -193,15 +193,13 @@ impl Para {
     /// Remove the characters in `start` from the start of the paragraph's text and those in
     /// `end` from its end.
     pub fn trim_with(&mut self, start: &[char], end: &[char]) {
-        while let Some(Inline::Text(t, _)) = self.inlines.first_mut() {
-            let n = t.trim_start_matches(start).len();
-            let cut = t.len() - n;
+        // The spans that are all `start` go in one drain: removing them one at a time from the
+        // front was quadratic (whitespace spans in alternating formats don't merge).
+        let blank = self.inlines.iter().take_while(|i| matches!(i, Inline::Text(t, _) if t.trim_start_matches(start).is_empty())).count();
+        self.inlines.drain(..blank);
+        if let Some(Inline::Text(t, _)) = self.inlines.first_mut() {
+            let cut = t.len().saturating_sub(t.trim_start_matches(start).len());
             t.replace_range(..cut, "");
-            if t.is_empty() {
-                self.inlines.remove(0);
-            } else {
-                break;
-            }
         }
         while let Some(Inline::Text(t, _)) = self.inlines.last_mut() {
             let n = t.trim_end_matches(end).len();
@@ -1264,6 +1262,33 @@ mod tests {
             FTable { rows: (0..20_000).map(|_| vec![Cell { rowspan: 1000, ..Default::default() }]).collect(), widths: Vec::new(), borderless: false };
         t.insert_covered();
         assert!(t.rows.iter().all(|r| r.len() <= 64), "a row grew past the column cap");
+    }
+
+    #[test]
+    fn trim_drops_many_leading_blank_spans_at_once() {
+        // Line breaks in alternating formats (`<b><br></b><i><br></i>`…) don't merge, and
+        // removing them one at a time from the front was quadratic: this took minutes.
+        let (b, i) = (Fmt { bold: true, ..Default::default() }, Fmt { italic: true, ..Default::default() });
+        let mut p = Para::default();
+        for _ in 0..100_000 {
+            p.push_text("\n", &b);
+            p.push_text(" ", &i);
+        }
+        p.push_text(" \tx ", &b);
+        p.push_text("\n", &i);
+        p.trim();
+        assert_eq!(p.inlines, vec![Inline::Text("x".into(), b.clone())]);
+        // A leading non-text inline stops the trim; an all-blank paragraph ends up empty.
+        let mut p = Para::default();
+        p.inlines.push(Inline::Anchor("a".into()));
+        p.push_text(" y", &b);
+        p.trim();
+        assert_eq!(p.inlines, vec![Inline::Anchor("a".into()), Inline::Text(" y".into(), b.clone())]);
+        let mut p = Para::default();
+        p.push_text(" ", &b);
+        p.push_text("\n", &i);
+        p.trim();
+        assert!(p.inlines.is_empty());
     }
 
     #[test]
