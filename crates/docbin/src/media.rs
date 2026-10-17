@@ -2,7 +2,7 @@
 //! ([MS-DOC] §2.9.190 PICF, §1.3.5 Pictures), and the shared store of every picture the
 //! document reads (inline and floating).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -26,6 +26,8 @@ pub(crate) struct Pictures {
     /// fc_pic → the inline picture already materialised (`None`: unreadable or over the cap,
     /// not retried).
     by_fc: HashMap<u32, Option<Inline>>,
+    /// fc_pic of the inline pictures some anchor already used.
+    used_fc: HashSet<u32>,
     /// BLIP store index → media key (`None`: unreadable, not retried).
     by_bse: HashMap<u32, Option<String>>,
     /// The media entries, merged into the document at the end.
@@ -43,6 +45,7 @@ impl Default for Pictures {
     fn default() -> Self {
         Pictures {
             by_fc: HashMap::new(),
+            used_fc: HashSet::new(),
             by_bse: HashMap::new(),
             media: BTreeMap::new(),
             total: 0,
@@ -64,19 +67,21 @@ pub(crate) struct Inline {
 }
 
 impl Pictures {
-    /// The inline picture at `fc_pic` in the Data stream, copying its bytes the first time.
-    /// `None` when the header is malformed, the picture can't be read, or a picture
-    /// count/byte cap is reached.
-    pub(crate) fn get(&mut self, data: &[u8], fc_pic: u32) -> Option<Inline> {
-        if let Some(hit) = self.by_fc.get(&fc_pic) {
-            return hit.clone();
+    /// The inline picture at `fc_pic` in the Data stream, copying its bytes the first time, and
+    /// whether an earlier anchor already used it (a repeat's copy of the alt text is the
+    /// caller's to pay for). `None` when the header is malformed, the picture can't be read, or
+    /// a picture count/byte cap is reached.
+    pub(crate) fn get(&mut self, data: &[u8], fc_pic: u32) -> Option<(&Inline, bool)> {
+        if !self.by_fc.contains_key(&fc_pic) {
+            if self.by_fc.len().saturating_add(self.by_bse.len()) >= MAX_PICTURES {
+                return None;
+            }
+            let pic = self.read(data, fc_pic);
+            self.by_fc.insert(fc_pic, pic);
         }
-        if self.by_fc.len().saturating_add(self.by_bse.len()) >= MAX_PICTURES {
-            return None;
-        }
-        let pic = self.read(data, fc_pic);
-        self.by_fc.insert(fc_pic, pic.clone());
-        pic
+        let pic = self.by_fc.get(&fc_pic)?.as_ref()?;
+        let repeat = !self.used_fc.insert(fc_pic);
+        Some((pic, repeat))
     }
 
     /// Read the inline picture at `fc_pic`: nothing is decoded or copied beyond what is left of

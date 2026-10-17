@@ -331,3 +331,67 @@ fn dib_conversion_caps_header_and_encoded_bytes() {
     assert!(normal.bytes.len() > bmp_size && normal.bytes.len() <= 512);
     assert_eq!(image::load_from_memory(&normal.bytes).unwrap().width(), 1);
 }
+
+/// A group (spid `spid`) of `n` rectangles, each with a child anchor.
+fn group_of(spid: u32, n: u32) -> Vec<u8> {
+    let anchor = |l: i32| rec(0, 0, 0xF00F, &[l, 0, l + 10, 10].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+    let space = rec(1, 0, 0xF009, &[0i32, 0, 10_000, 10].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+    let head = sp(&[space, fsp(0, spid, 0b1)]);
+    let kids: Vec<Vec<u8>> = (0..n).map(|i| sp(&[fsp(1, spid + 1 + i, 0b10), anchor(i as i32 * 10)])).collect();
+    container(0xF003, &[[head].as_slice(), &kids].concat())
+}
+
+/// WC-13 (#2757). Every `\x01` anchor on one cached inline picture copied its alt text (up to
+/// 4,096 UTF-16 units), and every `PlcfSpa` anchor naming one group spid rebuilt and copied
+/// the whole group: 200k anchors × 12 KB of alt text, or 20k anchors × 1,000 group members,
+/// from small streams. A repeat's alt text is now charged against the walk budget, and each
+/// spid is anchored once.
+#[test]
+fn repeated_anchors_do_not_copy_alt_text_or_groups_each_time() {
+    let alt = "x".repeat(4000);
+    let shape = sp(&[fsp(75, 1025, 0xA00), fopt(&[(0x0104, 1)], &[(0x0381, wz(&alt))])]);
+    let data = picf_shape(&[shape, fbse_png(&tiny_png())].concat());
+    let text: &'static str = Box::leak(format!("{}\r", "\u{1}".repeat(2000)).into_boxed_str());
+    let ccp = text.chars().count() as u32;
+    let spec = StructSpec { text, data_stream: data, chpx_runs: vec![(0, grpprl(&[(0x6A03, &0u32.to_le_bytes())]))], ..structured_spec(text, ccp) };
+    let file = struct_doc(&spec);
+    let doc = read(&file).expect("opens");
+    let p0 = doc.body.first().and_then(|b| b.as_para()).expect("para");
+    let alts: Vec<usize> = p0.objects.iter().filter_map(|o| if let InlineObject::Image { alt, .. } = o { Some(alt.len()) } else { None }).collect();
+    // The copies spend the walk budget (twice the WordDocument stream), so the walk stops early;
+    // a real file never anchors one Data-stream picture twice.
+    assert!(alts.len() >= 1000 && alts.len() <= 2000, "{} anchors", alts.len());
+    assert_eq!(alts.first(), Some(&4000), "the first keeps its alt text");
+    let total: usize = alts.iter().sum();
+    assert!(total <= 4000 + 2 * file.len(), "{total} bytes of alt text from a {}-byte file", file.len());
+
+    // 5000 anchors on one 1000-member group: one group is built.
+    let art = art_content(&[], &[group_of(3000, 1000)]);
+    let cps: Vec<u32> = (1..=5001).collect();
+    let spas = plc(&cps, &(0..5000).flat_map(|_| spa(3000, [0, 0, 1440, 1440], spa_flags(0, 0, 1, false))).collect::<Vec<_>>());
+    let text: &'static str = Box::leak(format!("A{}B\r", "\u{8}".repeat(5000)).into_boxed_str());
+    let ccp = text.chars().count() as u32;
+    let spec = StructSpec { text, extra_pairs: vec![(40, spas), (50, art)], ..structured_spec(text, ccp) };
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    let p0 = doc.body.first().and_then(|b| b.as_para()).expect("para");
+    let groups: Vec<usize> =
+        p0.objects.iter().filter_map(|o| if let InlineObject::Group { children, .. } = o { Some(children.len()) } else { None }).collect();
+    assert_eq!(groups, [1000], "one group, anchored once");
+}
+
+/// The members of every group of a document together are capped too.
+#[test]
+fn group_members_are_capped_per_document() {
+    let art = art_content(&[], &[group_of(3000, 1000), group_of(5000, 1000)]);
+    let content = officeart::content(&art);
+    let table = plc(&[1, 2, 3], &[spa(3000, [0, 0, 1440, 1440], 0), spa(5000, [0, 0, 1440, 1440], 0)].concat());
+    let stories = std::collections::HashMap::new();
+    let build = crate::drawing::Build { bstore: &[], delay: &[], stories: &stories, group_children: std::cell::Cell::new(1500) };
+    let mut pics = crate::media::Pictures::default();
+    let drawn = crate::drawing::anchors(&table, Some((0, table.len() as u32)), 0, &content.main, &build, &mut pics);
+    let sizes: Vec<usize> =
+        drawn.iter().filter_map(|(_, o)| if let InlineObject::Group { children, .. } = o { Some(children.len()) } else { None }).collect();
+    assert_eq!(sizes, [1000, 500]);
+    assert_eq!(build.group_children.get(), 0);
+    const { assert!(crate::drawing::MAX_DOC_GROUP_CHILDREN >= wordcraft_doc::para::MAX_GROUP_CHILDREN) };
+}

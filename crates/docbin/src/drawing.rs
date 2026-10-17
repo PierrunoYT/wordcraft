@@ -2,7 +2,8 @@
 //! ([MS-DOC] §2.8.27 PlcfSpa, §2.9.253 Spa) joined with the OfficeArt shapes they name, and the
 //! text box stories (`PlcftxbxTxt`, §2.8.30) that fill text boxes.
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 
 use wordcraft_doc::para::{Anchor, Float, FloatAlign, GroupChild, InlineObject, ShapeKind, Wrap};
 use wordcraft_doc::props::Rgb;
@@ -19,6 +20,9 @@ const CB_FTXBXS: usize = 22;
 const MAX_PT: f32 = 1584.0;
 /// Deepest group nesting flattened.
 const MAX_GROUP_DEPTH: usize = 8;
+/// Most group members materialised across every group of one document (each group also stops
+/// at the model's own per-group cap).
+pub(crate) const MAX_DOC_GROUP_CHILDREN: usize = 50_000;
 
 /// The (CP, data) entries of a PLC with `cb`-byte data elements, the trailing CP dropped.
 fn plc(table: &[u8], (fc, lcb): (u32, u32), cb: usize) -> Vec<(u32, &[u8])> {
@@ -65,11 +69,16 @@ pub(crate) struct Build<'a> {
     pub(crate) delay: &'a [u8],
     /// Text box part ids by shape spid.
     pub(crate) stories: &'a HashMap<u32, u32>,
+    /// Group members still allowed in this document (starts at [`MAX_DOC_GROUP_CHILDREN`]).
+    pub(crate) group_children: Cell<usize>,
 }
 
 /// The floating objects anchored by `PlcfSpa` (at `pair`), as (absolute anchor CP, object),
 /// sorted by CP. `cp_base` turns the PLC's CPs into absolute ones (the header subdocument's
 /// start for `PlcSpaHdr`).
+///
+/// A shape has one anchor: a spid anchored again (a hostile PLC pointing thousands of anchors
+/// at one big group, each rebuilt and copied) is skipped after its first anchor.
 pub(crate) fn anchors(
     table: &[u8],
     pair: Option<(u32, u32)>,
@@ -80,12 +89,16 @@ pub(crate) fn anchors(
 ) -> Vec<(u32, InlineObject)> {
     let Some(pair) = pair else { return Vec::new() };
     let mut out = Vec::new();
+    let mut anchored = HashSet::new();
     for (cp, spa) in plc(table, pair, CB_SPA) {
         let i32_at = |o: usize| spa.get(o..o + 4).and_then(|b| b.try_into().ok()).map(i32::from_le_bytes).unwrap_or(0);
         let spid = i32_at(0) as u32;
         let [xl, yt, xr, yb] = [4, 8, 12, 16].map(i32_at);
         let flags = spa.get(20..22).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
         let Some(node) = shapes.get(&spid) else { continue };
+        if !anchored.insert(spid) {
+            continue;
+        }
         let tw = |v: i64| (v as f32 / 20.0).clamp(-2.0 * MAX_PT, 2.0 * MAX_PT);
         let (mut x, mut y) = (tw(xl as i64), tw(yt as i64));
         let (mut w, mut h) = (tw(xr as i64 - xl as i64).clamp(0.0, MAX_PT), tw(yb as i64 - yt as i64).clamp(0.0, MAX_PT));
@@ -239,7 +252,7 @@ fn members_into(nodes: &[Node], t: (f32, f32, f32, f32), depth: usize, b: &Build
     let (x0, y0, sx, sy) = t;
     let fit = |v: f32| if v.is_finite() { v.clamp(-1e7, 1e7) } else { 0.0 };
     for n in nodes {
-        if out.len() >= wordcraft_doc::para::MAX_GROUP_CHILDREN {
+        if out.len() >= wordcraft_doc::para::MAX_GROUP_CHILDREN || b.group_children.get() == 0 {
             return;
         }
         let sp = n.sp();
@@ -261,6 +274,7 @@ fn members_into(nodes: &[Node], t: (f32, f32, f32, f32), depth: usize, b: &Build
                 let float = Float { rot: sp.props.rot, flip_h: sp.flip_h(), flip_v: sp.flip_v(), ..Float::default() };
                 let (w, h) = (fit(ew * sx).max(0.0), fit(eh * sy).max(0.0));
                 if let Some(obj) = leaf(sp, w, h, float, b, pics) {
+                    b.group_children.set(b.group_children.get().saturating_sub(1));
                     out.push(GroupChild { x: fit(x0 + ox * sx), y: fit(y0 + oy * sy), obj });
                 }
             }

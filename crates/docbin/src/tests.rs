@@ -1717,9 +1717,10 @@ fn picture_bytes_are_capped_per_document() {
     let data: Vec<u8> = [a.clone(), b].concat();
     let mut pics = crate::media::Pictures::default();
     pics.limit = 1000;
-    let first = pics.get(&data, 0).expect("first fits");
+    let (first, repeat) = pics.get(&data, 0).map(|(p, r)| (p.key.clone(), r)).expect("first fits");
+    assert!(!repeat, "the first use");
     // Same location again: no new bytes.
-    assert_eq!(pics.get(&data, 0).map(|p| p.key), Some(first.key.clone()));
+    assert_eq!(pics.get(&data, 0).map(|(p, r)| (p.key.clone(), r)), Some((first, true)));
     // A second distinct picture would exceed the cap.
     assert!(pics.get(&data, a.len() as u32).is_none());
     assert_eq!(pics.media.len(), 1);
@@ -1739,8 +1740,8 @@ fn rejected_inline_pictures_are_not_read_again() {
     assert!(pics.get(&small, 0).is_none());
     // The rejected picture took nothing off the cap, and anchors sharing a picture share it.
     let at = big.len() as u32;
-    let fits = pics.get(&data, at).expect("fits");
-    assert_eq!(pics.get(&data, at).map(|p| p.key), Some(fits.key));
+    let fits = pics.get(&data, at).map(|(p, _)| p.key.clone()).expect("fits");
+    assert_eq!(pics.get(&data, at).map(|(p, _)| p.key.clone()), Some(fits));
     assert_eq!(pics.media.len(), 1);
     // Filling the cap exactly works; after that, a place never tried before isn't read.
     let rest = picf_with_png(700);

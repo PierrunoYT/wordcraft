@@ -209,7 +209,12 @@ pub fn read_with_password(bytes: &[u8], password: Option<&str>) -> Result<Docume
             tb_stories.insert(spid, doc.add_part(PartKind::TextBox, blocks));
         }
     }
-    let build = drawing::Build { bstore: &art.bstore, delay: &word, stories: &tb_stories };
+    let build = drawing::Build {
+        bstore: &art.bstore,
+        delay: &word,
+        stories: &tb_stories,
+        group_children: std::cell::Cell::new(drawing::MAX_DOC_GROUP_CHILDREN),
+    };
     let mut drawn = drawing::anchors(&table, fib.pair(fib::pair::PLC_SPA_MOM), 0, &art.main, &build, &mut pics);
     drawn.extend(drawing::anchors(&table, fib.pair(fib::pair::PLC_SPA_HDR), hdd_base, &art.header, &build, &mut pics));
     drawn.sort_by_key(|(cp, _)| *cp);
@@ -519,13 +524,17 @@ fn walk(ctx: &WalkCtx, cp_start: u32, cp_end: u32, pics: &mut media::Pictures) -
                 let fc = ctx.pieces.fc_of_cp(cp).unwrap_or(0);
                 let fc_pic = pic_location(ctx.chpx_bins.chpx(ctx.word, fc));
                 match fc_pic.and_then(|at| pics.get(ctx.data, at)) {
-                    Some(p) => {
+                    Some((p, repeat)) => {
+                        // The first anchor on a picture gets its alt text free (it came out of
+                        // the Data stream once); every repeat's copy is charged against the walk
+                        // budget, so thousands of anchors can't each copy kilobytes of it.
+                        let alt = if !repeat || charge(ctx.budget, p.alt.len()) { p.alt.clone() } else { String::new() };
                         pb.push('\u{FFFC}', CharProps::default());
                         pb.objects.push(InlineObject::Image {
-                            media: p.key,
+                            media: p.key.clone(),
                             w: p.w,
                             h: p.h,
-                            alt: p.alt,
+                            alt,
                             float: Default::default(),
                             crop: p.crop,
                             ole: None,
