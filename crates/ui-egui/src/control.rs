@@ -263,9 +263,12 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
             }
         }
         "ui.resize" => {
-            let (Some(w), Some(h)) = (f("width"), f("height")) else { return err("missing width/height") };
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
-            ok(json!({}))
+            let size = match resize_size(p) {
+                Ok(s) => s,
+                Err(e) => return err(e),
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            ok(json!({"width": size.x, "height": size.y}))
         }
         "ui.focus" => {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -287,6 +290,22 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
             }
         }
     }
+}
+
+/// The smallest and largest window size `ui.resize` asks for, in points: a huge window can
+/// exceed the GPU's texture limit and abort the app.
+const RESIZE_RANGE: (f32, f32) = (200.0, 8192.0);
+
+/// The window size `ui.resize {width, height}` asks for: both finite, clamped to
+/// [`RESIZE_RANGE`].
+fn resize_size(p: &Value) -> Result<egui::Vec2, &'static str> {
+    let dim = |k: &str| p.get(k).and_then(Value::as_f64).map(|v| v as f32);
+    let (Some(w), Some(h)) = (dim("width"), dim("height")) else { return Err("missing width/height") };
+    if !w.is_finite() || !h.is_finite() {
+        return Err("width/height must be finite");
+    }
+    let (lo, hi) = RESIZE_RANGE;
+    Ok(egui::vec2(w.clamp(lo, hi), h.clamp(lo, hi)))
 }
 
 /// A page rendered by the engine, as base64 PNG in the reply (the same shape as the headless
@@ -319,4 +338,24 @@ pub fn save_screenshot(image: &egui::ColorImage, path: Option<&str>) -> Value {
         }
     }
     json!({"ok": true, "result": {"path": path, "width": w, "height": h}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_is_clamped_and_finite() {
+        let size = |p: Value| resize_size(&p).map(|v| (v.x, v.y));
+        assert_eq!(size(json!({"width": 1280, "height": 800})), Ok((1280.0, 800.0)));
+        // WC-31: a window beyond the GPU texture limit, or no window at all, is never asked for.
+        assert_eq!(size(json!({"width": 30000, "height": 30000})), Ok((8192.0, 8192.0)));
+        assert_eq!(size(json!({"width": 0, "height": -5})), Ok((200.0, 200.0)));
+        // Beyond f32: not finite once converted, refused.
+        assert!(size(json!({"width": 1e300, "height": 800})).is_err());
+        assert!(size(json!({"width": 800, "height": -1e300})).is_err());
+        assert!(size(json!({"width": 800})).is_err());
+        assert!(size(json!({"width": "800", "height": 600})).is_err());
+        assert!(size(json!({})).is_err());
+    }
 }
