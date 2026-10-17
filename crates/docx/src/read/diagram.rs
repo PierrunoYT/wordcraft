@@ -1,6 +1,8 @@
 //! SmartArt diagrams: the ready-made drawing (`dsp:drawing`) Word keeps beside the diagram data,
 //! converted to [`GraphicItem`]s. The diagram's layout isn't run; the saved drawing is the picture.
 
+use std::sync::Arc;
+
 use wordcraft_doc::graphic::{GraphicItem, PathSeg, TextAlign};
 use wordcraft_doc::para::ShapeKind;
 use wordcraft_doc::props::Rgb;
@@ -502,13 +504,18 @@ pub(crate) fn wrap(text: &str, size: f32, width: f32, max: usize) -> Vec<String>
     lines
 }
 
+/// The data part of a SmartArt diagram (`a:graphicData` with `dgm:relIds/@r:dm`).
+pub(super) fn diagram_data_part(gd: &El, rels: &Rels) -> Option<String> {
+    let dm = gd.child("dgm:relIds")?.attr("r:dm")?;
+    super::part_of(rels, dm, rt::DIAGRAM_DATA)
+}
+
 impl Reader<'_> {
     /// The drawing part of a SmartArt diagram (`a:graphicData` with `dgm:relIds`): the one its
     /// data part names, else the drawing numbered like the data part. `None` when there's none.
     pub(super) fn diagram_part(&mut self, gd: &El, rels: &Rels) -> Option<String> {
-        let dm = gd.child("dgm:relIds")?.attr("r:dm")?;
-        let data = super::part_of(rels, dm, rt::DIAGRAM_DATA)?;
-        let ext_id = self.graphic_part(&data).and_then(|d| d.find("dsp:dataModelExt").and_then(|e| e.attr("relId")).map(str::to_string));
+        let data = diagram_data_part(gd, rels)?;
+        let ext_id = self.data_model_ext(&data);
         let is_drawing = |r: &&Rel| !r.external && rel_is(&r.kind, rt::DIAGRAM_DRAWING);
         let drawing = ext_id.as_deref().and_then(|id| rels.by_id(id)).filter(is_drawing).or_else(|| {
             // No usable relationship id: the drawing whose number matches the data part's.
@@ -522,24 +529,44 @@ impl Reader<'_> {
     /// The id of the relationship to a SmartArt diagram's drawing part, as its data part names it
     /// (`dsp:dataModelExt relId`): the id the parts use, not the markup, so it's kept with them.
     pub(super) fn diagram_drawing_rel(&mut self, gd: &El, rels: &Rels) -> Option<String> {
-        let dm = gd.child("dgm:relIds")?.attr("r:dm")?;
-        let data = super::part_of(rels, dm, rt::DIAGRAM_DATA)?;
-        let id = self.graphic_part(&data)?.find("dsp:dataModelExt")?.attr("relId")?.to_string();
+        let data = diagram_data_part(gd, rels)?;
+        let id = self.data_model_ext(&data)?;
         rels.by_id(&id).is_some_and(|r| !r.external && rel_is(&r.kind, rt::DIAGRAM_DRAWING)).then_some(id)
+    }
+
+    /// The relationship id diagram data part `data` names its drawing by (`dsp:dataModelExt
+    /// relId`), looked up once per part: the search walks the whole part, and every drawing of
+    /// the diagram asks.
+    fn data_model_ext(&mut self, data: &str) -> Option<String> {
+        let pkg = self.pkg;
+        let data = pkg.canonical(data)?;
+        if let Some(id) = self.diagram_ext.get(data) {
+            return id.clone();
+        }
+        let id = self.graphic_part(data).and_then(|d| d.find("dsp:dataModelExt").and_then(|e| e.attr("relId")).map(str::to_string));
+        self.diagram_ext.insert(data.to_string(), id.clone());
+        id
     }
 
     /// The SmartArt model of a diagram WordCraft wrote (its data part exactly as WordCraft writes
     /// it); `None` for any other.
     pub(super) fn smart_art_spec(&mut self, gd: &El, rels: &Rels) -> Option<wordcraft_doc::smart_art::SmartArtSpec> {
-        let dm = gd.child("dgm:relIds")?.attr("r:dm")?;
-        let data = super::part_of(rels, dm, rt::DIAGRAM_DATA)?;
+        let data = diagram_data_part(gd, rels)?;
         crate::smart_art::spec_of(self.graphic_part(&data)?.as_ref())
     }
 
     /// The items of the SmartArt drawing part at `path`, fitted to `w` × `h` points.
     pub(super) fn diagram_drawing(&mut self, path: &str, w: f32, h: f32) -> Vec<GraphicItem> {
         let Some(root) = self.graphic_part(path) else { return Vec::new() };
-        let drels = self.pkg.rels(path);
+        // The drawing's relationships, read once per part (not once per size it's built at).
+        let drels = match self.diagram_rels.get(path) {
+            Some(r) => r.clone(),
+            None => {
+                let r = Arc::new(self.pkg.rels(path));
+                self.diagram_rels.insert(path.to_string(), r.clone());
+                r
+            }
+        };
         let theme = self.doc.settings.theme_colors.clone();
         let mut image = |id: &str| self.media_for(&drels, id);
         diagram_items(&root, &theme, w, h, &mut image)

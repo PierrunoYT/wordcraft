@@ -9,6 +9,7 @@
 //! [`EmbeddedManifest`](crate::package::EmbeddedManifest). The font table and the fonts it embeds
 //! are kept the same way.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use wordcraft_doc::graphic::{Embedded, EmbeddedRef};
@@ -77,8 +78,8 @@ impl Reader<'_> {
                 if !self.doc.sources.is_empty() && self.xml(&rel.target).ok().flatten().is_some_and(|r| r.local() == "Sources") {
                     continue;
                 }
-                if self.keep_part_tree(&rel.target) {
-                    roots.push_str(&format!("{owner}\t{}\t{}\n", rel.kind, rel.target));
+                if let Some(part) = self.keep_part_tree(&rel.target) {
+                    roots.push_str(&format!("{owner}\t{}\t{part}\n", rel.kind));
                 }
             }
         }
@@ -94,11 +95,11 @@ impl Reader<'_> {
     /// relationship the main document's markup refers to by id (its target goes with the
     /// element, or not at all).
     pub(super) fn keep_unmodelled(&mut self, package: &Rels, document: &Rels) {
-        let main = self.pkg.get(&self.main).map(|b| b.to_vec()).unwrap_or_default();
-        let referenced = |id: &str| {
-            let needle = format!("\"{id}\"");
-            main.windows(needle.len()).any(|w| w == needle.as_bytes())
-        };
+        let pkg = self.pkg;
+        let main = pkg.get(&self.main).unwrap_or_default();
+        let ids: HashSet<&str> = document.list.iter().filter(|r| !r.external).take(MAX_EMBEDDED_RELS).map(|r| r.id.as_str()).collect();
+        let found = quoted_ids(main, &ids);
+        let referenced = |id: &str| found.contains(id);
         let mut roots = String::new();
         for (owner, rels) in [("P", package), ("D", document)] {
             for rel in rels.list.iter().filter(|r| !r.external).take(MAX_EMBEDDED_RELS) {
@@ -109,8 +110,8 @@ impl Reader<'_> {
                 {
                     continue;
                 }
-                if self.keep_part_tree(&rel.target) {
-                    roots.push_str(&format!("{owner}\t{}\t{}\n", rel.kind, rel.target));
+                if let Some(part) = self.keep_part_tree(&rel.target) {
+                    roots.push_str(&format!("{owner}\t{}\t{part}\n", rel.kind));
                 }
             }
         }
@@ -130,35 +131,39 @@ impl Reader<'_> {
         let mut refs = Vec::new();
         for id in &ids {
             let rel = rels.by_id(id)?;
-            if !rel.external && !self.keep_part_tree(&rel.target) {
-                return None;
-            }
-            refs.push(EmbeddedRef { id: id.clone(), kind: rel.kind.clone(), target: rel.target.clone(), external: rel.external });
+            let target = if rel.external { rel.target.clone() } else { self.keep_part_tree(&rel.target)? };
+            refs.push(EmbeddedRef { id: id.clone(), kind: rel.kind.clone(), target, external: rel.external });
         }
         for id in extra.iter().filter(|id| !ids.contains(id)) {
             if let Some(rel) = rels.by_id(id).filter(|r| !r.external)
-                && self.keep_part_tree(&rel.target)
+                && let Some(target) = self.keep_part_tree(&rel.target)
             {
-                refs.push(EmbeddedRef { id: id.clone(), kind: rel.kind.clone(), target: rel.target.clone(), external: false });
+                refs.push(EmbeddedRef { id: id.clone(), kind: rel.kind.clone(), target, external: false });
             }
         }
         let xml = standalone_xml(el)?;
         Some(Arc::new(Embedded { xml, refs }))
     }
 
-    /// Keep part `root` and every part it reaches through its relationships. False when `root`
-    /// itself can't be kept.
-    pub(super) fn keep_part_tree(&mut self, root: &str) -> bool {
+    /// Keep part `root` and every part it reaches through its relationships, by the names the
+    /// package stores them under (so case variants of a name keep one part). The name `root` is
+    /// kept under; `None` when it can't be kept.
+    pub(super) fn keep_part_tree(&mut self, root: &str) -> Option<String> {
+        let pkg = self.pkg;
+        let Some(root) = pkg.canonical(root) else {
+            log::warn!("docx: part {root} of an embedded object is missing");
+            return None;
+        };
         if self.embedded.parts.contains_key(root) {
-            return true;
+            return Some(root.to_string());
         }
         if !self.keep_part(root) {
-            return false;
+            return None;
         }
         let mut todo = vec![root.to_string()];
         while let Some(part) = todo.pop() {
             let mut kept: Vec<Rel> = Vec::new();
-            for r in self.pkg.rels(&part).list {
+            for mut r in pkg.rels(&part).list {
                 if kept.len() >= MAX_EMBEDDED_RELS {
                     log::warn!("docx: part {part} has more than {MAX_EMBEDDED_RELS} relationships; the rest are dropped");
                     break;
@@ -166,11 +171,18 @@ impl Reader<'_> {
                 if ![&r.id, &r.kind, &r.target].iter().all(|f| manifest_field_ok(f)) || kept.iter().any(|k| k.id == r.id) {
                     continue;
                 }
-                if !r.external && !self.embedded.parts.contains_key(&r.target) {
-                    if !self.keep_part(&r.target) {
+                if !r.external {
+                    let Some(target) = pkg.canonical(&r.target) else {
+                        log::warn!("docx: part {} of an embedded object is missing", r.target);
                         continue;
+                    };
+                    r.target = target.to_string();
+                    if !self.embedded.parts.contains_key(&r.target) {
+                        if !self.keep_part(&r.target) {
+                            continue;
+                        }
+                        todo.push(r.target.clone());
                     }
-                    todo.push(r.target.clone());
                 }
                 kept.push(r);
             }
@@ -178,7 +190,7 @@ impl Reader<'_> {
                 p.rels = kept;
             }
         }
-        true
+        Some(root.to_string())
     }
 
     /// Keep one part's bytes and content type (not its relationships).
@@ -192,17 +204,38 @@ impl Reader<'_> {
             log::warn!("docx: more than {MAX_EMBEDDED_PARTS} parts for embedded objects; the rest are dropped");
             return false;
         }
-        let Some(bytes) = self.pkg.get(part) else {
+        let Some(bytes) = self.pkg.shared(part) else {
             log::warn!("docx: part {part} of an embedded object is missing");
             return false;
         };
         let pkg = self.pkg;
         let ct = self.content_types.get_or_insert_with(|| ContentTypes::read(pkg)).of(part).unwrap_or("application/octet-stream");
         let content_type = if manifest_field_ok(ct) { ct.to_string() } else { "application/octet-stream".to_string() };
-        self.doc.passthrough.entry(part.to_string()).or_insert_with(|| Arc::new(bytes.to_vec()));
+        self.doc.passthrough.entry(part.to_string()).or_insert(bytes);
         self.embedded.parts.insert(part.to_string(), crate::package::EmbeddedPart { content_type, rels: Vec::new() });
         true
     }
+}
+
+/// The members of `ids` that appear in `xml` between double quotes (`"rId5"`, an attribute
+/// value), found in one pass however many ids there are.
+fn quoted_ids<'a>(xml: &[u8], ids: &HashSet<&'a str>) -> HashSet<&'a str> {
+    let longest = ids.iter().map(|id| id.len()).max().unwrap_or(0);
+    let mut found = HashSet::new();
+    let mut open: Option<usize> = None;
+    for (i, b) in xml.iter().enumerate() {
+        if *b != b'"' {
+            continue;
+        }
+        if let Some(start) = open
+            && i.saturating_sub(start) <= longest.saturating_add(1)
+            && let Some(id) = xml.get(start + 1..i).and_then(|s| std::str::from_utf8(s).ok()).and_then(|s| ids.get(s))
+        {
+            found.insert(*id);
+        }
+        open = Some(i);
+    }
+    found
 }
 
 /// The relationship ids `e` uses (attributes in the relationships namespace, and VML's
@@ -236,4 +269,28 @@ fn standalone_xml(e: &El) -> Option<String> {
     }
     s.push_str(rest);
     (s.len() <= MAX_EMBEDDED_XML).then_some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WC-24: which relationship ids the main part uses is found in one pass over it, with the
+    /// same answer the per-id search gave: an id between double quotes anywhere.
+    #[test]
+    fn quoted_ids_finds_ids_in_one_pass() {
+        let ids: HashSet<&str> = ["rId1", "rId2", "rId10", "web"].into_iter().collect();
+        let xml = br#"<w:p r:id="rId1" w:val="rId10x"><a:blip r:embed="rId10"/><w:t>"web" rId2</w:t></w:p>"#;
+        let found = quoted_ids(xml, &ids);
+        let mut found: Vec<&str> = found.into_iter().collect();
+        found.sort_unstable();
+        assert_eq!(found, ["rId1", "rId10", "web"]);
+        assert!(quoted_ids(b"", &ids).is_empty());
+        assert!(quoted_ids(b"\"rId1", &ids).is_empty());
+        // A 4 MB part against a thousand ids: one pass, not one per id.
+        let many: Vec<String> = (0..MAX_EMBEDDED_RELS).map(|i| format!("rId{i}")).collect();
+        let many: HashSet<&str> = many.iter().map(String::as_str).collect();
+        let big = "<w:p w:val=\"x\"/>".repeat(250_000) + "<w:p r:id=\"rId77\"/>";
+        assert_eq!(quoted_ids(big.as_bytes(), &many).into_iter().collect::<Vec<_>>(), ["rId77"]);
+    }
 }

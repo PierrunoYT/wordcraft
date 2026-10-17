@@ -1103,12 +1103,21 @@ impl Reader<'_> {
             GraphicKind::Ink => None,
         };
         let Some(path) = part else { return Arc::new(Graphic { kind, items: Vec::new(), w, h, source, chart: None, smart_art: None }) };
+        // By the stored name: case variants of a part name are one part.
+        let path = self.pkg.canonical(&path).map(str::to_string).unwrap_or(path);
         let key = (kind, path, w.to_bits(), h.to_bits());
         if let Some(g) = self.graphics.get(&key) {
             return g.clone();
         }
         let items = if self.graphic_budget == 0 { Vec::new() } else { self.graphic_items(kind, &key.1, w, h) };
-        self.graphic_budget = self.graphic_budget.saturating_sub(graphic_work(&items));
+        // Building walks the part (and a diagram's data part), whatever it draws: charge that too.
+        let data = match kind {
+            GraphicKind::Diagram => super::diagram::diagram_data_part(gd, rels),
+            _ => None,
+        };
+        let input = [Some(key.1.as_str()), data.as_deref()].into_iter().flatten().map(|p| self.pkg.get(p).map_or(0, <[u8]>::len)).sum::<usize>();
+        let cost = graphic_work(&items).saturating_add(input / super::GRAPHIC_INPUT_BYTES).saturating_add(1);
+        self.graphic_budget = self.graphic_budget.saturating_sub(cost);
         // A chart or SmartArt that is exactly what WordCraft writes for its model can be edited
         // (and is written from the model); any other stays as it was read.
         let chart = match kind {

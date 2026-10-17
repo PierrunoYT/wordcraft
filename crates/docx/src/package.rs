@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read, Write};
+use std::sync::Arc;
 
 use crate::DocxError;
 use crate::xml::{self, El};
@@ -156,7 +157,11 @@ pub fn rel_is(t: &str, full: &str) -> bool {
 
 /// The decompressed parts of a package (bounded).
 pub struct Package {
-    files: BTreeMap<String, Vec<u8>>,
+    /// Shared, so a reader keeping a part (a picture, an opaque part) doesn't copy it.
+    files: BTreeMap<String, Arc<Vec<u8>>>,
+    /// Lowercased part name → the name it is stored under. OPC part names compare
+    /// case-insensitively, so a package holds one part per lowercased name.
+    lower: HashMap<String, String>,
 }
 
 impl Package {
@@ -171,6 +176,9 @@ impl Package {
         }
         let mut files = BTreeMap::new();
         let mut total: u64 = 0;
+        // Compressed data ranges read so far (start → end): entries sharing or overlapping their
+        // data would make one small stream inflate once per entry.
+        let mut ranges: BTreeMap<u64, u64> = BTreeMap::new();
         for i in 0..zip.len() {
             let mut f = match zip.by_index(i) {
                 Ok(f) => f,
@@ -186,36 +194,74 @@ impl Package {
             if f.size() > max_part {
                 return Err(DocxError::Limit(format!("part {name} declares {} bytes", f.size())));
             }
+            let start = f.data_start();
+            let end = start.saturating_add(f.compressed_size());
+            if end > start {
+                let before = ranges.range(..=start).next_back().is_some_and(|(_, e)| *e > start);
+                let after = ranges.range(start..).next().is_some_and(|(s, _)| *s < end);
+                if before || after {
+                    return Err(DocxError::Zip(format!("zip entry {name} overlaps another entry's data")));
+                }
+                ranges.insert(start, end);
+            }
             let room = max_part.min(max_total.saturating_sub(total));
             let mut buf = Vec::with_capacity(f.size().min(16 * 1024 * 1024) as usize);
             let read = (&mut f).take(room + 1).read_to_end(&mut buf);
+            // What was inflated counts against the total whether or not the entry turns out
+            // readable (a bad checksum is only found at its end).
+            total = total.saturating_add(buf.len() as u64);
+            if buf.len() as u64 > room {
+                return Err(DocxError::Limit(format!("part {name} decompresses past the size limit")));
+            }
             if let Err(e) = read {
                 // A corrupt entry: keep going unless it's a part we can't do without.
                 log::warn!("docx: zip entry {name} unreadable: {e}");
                 continue;
             }
-            if buf.len() as u64 > room {
-                return Err(DocxError::Limit(format!("part {name} decompresses past the size limit")));
-            }
-            total = total.saturating_add(buf.len() as u64);
             files.insert(name, buf);
         }
-        Ok(Package { files })
+        Ok(Package::from_parts(files))
     }
 
     /// A package from parts already in memory (a Flat OPC file, a converted document), by part
-    /// name without the leading `/`.
-    pub fn from_parts(files: BTreeMap<String, Vec<u8>>) -> Package {
-        Package { files }
+    /// name without the leading `/`. Of parts whose names differ only in case, the first (in
+    /// name order) is kept: they name the same part.
+    pub fn from_parts(mut files: BTreeMap<String, Vec<u8>>) -> Package {
+        let mut lower: HashMap<String, String> = HashMap::new();
+        let mut dropped = Vec::new();
+        for name in files.keys() {
+            match lower.entry(name.to_ascii_lowercase()) {
+                std::collections::hash_map::Entry::Occupied(_) => dropped.push(name.clone()),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(name.clone());
+                }
+            }
+        }
+        for name in dropped {
+            log::warn!("docx: dropping part {name}, a case variant of another part's name");
+            files.remove(&name);
+        }
+        Package { files: files.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(), lower }
     }
 
-    /// Part bytes by name (leading `/` ignored; case-insensitive fallback).
-    pub fn get(&self, name: &str) -> Option<&[u8]> {
+    /// The name part `name` is stored under (leading `/` ignored; case-insensitive), if any.
+    /// Readers key their caches by it, so case variants of one name share an entry.
+    pub fn canonical(&self, name: &str) -> Option<&str> {
         let n = name.trim_start_matches('/');
-        if let Some(v) = self.files.get(n) {
-            return Some(v);
+        if let Some((k, _)) = self.files.get_key_value(n) {
+            return Some(k);
         }
-        self.files.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.as_slice())
+        self.lower.get(&n.to_ascii_lowercase()).map(String::as_str)
+    }
+
+    /// Part bytes by name (leading `/` ignored; case-insensitive).
+    pub fn get(&self, name: &str) -> Option<&[u8]> {
+        self.files.get(self.canonical(name)?).map(|b| b.as_slice())
+    }
+
+    /// [`Package::get`], shared rather than borrowed (for keeping a part in a document).
+    pub fn shared(&self, name: &str) -> Option<Arc<Vec<u8>>> {
+        self.files.get(self.canonical(name)?).cloned()
     }
 
     pub fn xml(&self, name: &str) -> Result<Option<El>, DocxError> {
@@ -398,6 +444,57 @@ mod tests {
             Err(_) => {}
             Ok(p) => assert!(p.get("a.xml").is_none_or(|b| b.len() < 1024)),
         }
+    }
+
+    /// Offset of the `n`th record with signature `sig` in `z`.
+    fn record(z: &[u8], sig: [u8; 4], n: usize) -> usize {
+        z.windows(4).enumerate().filter(|(_, w)| *w == sig).nth(n).map(|(i, _)| i).unwrap()
+    }
+    const LOCAL: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
+    const CENTRAL: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
+
+    /// WC-23: an entry that inflates in full and then fails its checksum still counts against
+    /// the total, so a package can't inflate the same bomb once per entry for free.
+    #[test]
+    fn unreadable_entries_count_against_the_total() {
+        let mut z = zip_of(&[("a.xml", vec![b' '; 600_000]), ("b.xml", vec![b' '; 600_000])]);
+        assert!(Package::open_limited(&z, 1_000_000, 1_000_000).is_err(), "both fit only separately");
+        // Break a.xml's checksum (local header and central directory): it reads in full, then fails.
+        for (pos, off) in [(record(&z, LOCAL, 0), 14), (record(&z, CENTRAL, 0), 16)] {
+            z[pos + off] ^= 0xFF;
+        }
+        let skipped = Package::open_limited(&z, 1_000_000, 10_000_000).unwrap();
+        assert!(skipped.get("a.xml").is_none() && skipped.get("b.xml").is_some());
+        assert!(matches!(Package::open_limited(&z, 1_000_000, 1_000_000), Err(DocxError::Limit(_))));
+    }
+
+    /// WC-23: entries sharing (or overlapping) compressed data are refused, so one small stream
+    /// can't be inflated once per entry.
+    #[test]
+    fn entries_sharing_data_are_refused() {
+        let mut z = zip_of(&[("a.xml", vec![b' '; 10_000]), ("b.xml", vec![b' '; 10_000])]);
+        assert!(Package::open(&z).is_ok());
+        // Point b.xml's central directory entry at a.xml's local header.
+        let pos = record(&z, CENTRAL, 1) + 42;
+        z[pos..pos + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(Package::open(&z), Err(DocxError::Zip(_))));
+    }
+
+    /// WC-08: part names compare case-insensitively: case variants find the one stored part,
+    /// and a package holding two spellings of one name keeps one.
+    #[test]
+    fn case_variant_names_are_one_part() {
+        let mut files = BTreeMap::new();
+        files.insert("word/media/Pic.png".to_string(), b"one".to_vec());
+        files.insert("word/media/pic.PNG".to_string(), b"two".to_vec());
+        files.insert("word/document.xml".to_string(), b"<x/>".to_vec());
+        let p = Package::from_parts(files);
+        assert_eq!(p.canonical("/WORD/MEDIA/PIC.png"), Some("word/media/Pic.png"));
+        assert_eq!(p.get("word/media/pic.png"), Some(&b"one"[..]));
+        assert_eq!(p.canonical("word/document.xml"), Some("word/document.xml"));
+        assert_eq!(p.canonical("word/missing.xml"), None);
+        assert_eq!(p.files.len(), 2);
+        assert!(Arc::ptr_eq(&p.shared("word/media/PIC.PNG").unwrap(), &p.shared("word/media/Pic.png").unwrap()));
     }
 
     #[test]

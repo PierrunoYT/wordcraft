@@ -45,6 +45,13 @@ const MAX_HF_DEPTH: usize = 4;
 /// Most graphic work (items plus path segments, see `story::graphic_work`) built for one file's
 /// charts and diagrams; later ones are left empty.
 const MAX_GRAPHIC_WORK: usize = 2_000_000;
+/// Bytes of a chart or diagram part that count as one unit of graphic work each time a graphic
+/// is built from it: a build walks its whole part, so one heavy part built at thousands of
+/// sizes spends the budget as thousands of parts would.
+const GRAPHIC_INPUT_BYTES: usize = 64;
+/// Most bytes of chart and diagram parts parsed and kept (as trees) for one file; parts past it
+/// are left unread, and their graphics empty.
+const MAX_GRAPHIC_PART_BYTES: usize = 32 * 1024 * 1024;
 /// Bibliography sources kept from a file (Word's own source manager holds far fewer).
 const MAX_SOURCES: usize = 10_000;
 /// Custom XML parts looked at for bibliography sources.
@@ -92,6 +99,12 @@ pub(crate) struct Reader<'p> {
     graphics: HashMap<(GraphicKind, String, u32, u32), Arc<Graphic>>,
     /// Graphic work left before charts and diagrams are left empty (see [`MAX_GRAPHIC_WORK`]).
     graphic_budget: usize,
+    /// Bytes of chart and diagram parts left to parse (see [`MAX_GRAPHIC_PART_BYTES`]).
+    graphic_part_bytes: usize,
+    /// SmartArt data part → the relationship id it names its drawing by.
+    diagram_ext: HashMap<String, Option<String>>,
+    /// SmartArt drawing part → its relationships.
+    diagram_rels: HashMap<String, Arc<Rels>>,
     /// Drawing ids connectors are glued to (`a:stCxn`, `a:endCxn`), and whether any shape's id
     /// was kept while reading (those not glued to are dropped at the end).
     pub glued: HashSet<u32>,
@@ -162,6 +175,9 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
         graphic_parts: HashMap::new(),
         graphics: HashMap::new(),
         graphic_budget: MAX_GRAPHIC_WORK,
+        graphic_part_bytes: MAX_GRAPHIC_PART_BYTES,
+        diagram_ext: HashMap::new(),
+        diagram_rels: HashMap::new(),
         glued: HashSet::new(),
         shape_ids: false,
         main: main.clone(),
@@ -175,7 +191,7 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
 
     // The font table and the fonts embedded through it ride along as opaque parts.
     if let Some(p) = part(rt::FONT_TABLE) {
-        r.keep_part_tree(&p);
+        let _ = r.keep_part_tree(&p);
         r.read_font_families(&p);
     }
     if let Some(p) = part(rt::THEME) {
@@ -281,9 +297,9 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
     // bytes, never parsed or run, so a .docm/.dotm saved again carries exactly what the file had.
     // Only the relationships and content types are read.
     if let Some(v) = part(rt::VBA_PROJECT)
-        && let Some(b) = pkg.get(&v).filter(|b| !b.is_empty())
+        && let Some(b) = pkg.shared(&v).filter(|b| !b.is_empty())
     {
-        r.doc.passthrough.insert(VBA_PROJECT_PART.into(), Arc::new(b.to_vec()));
+        r.doc.passthrough.insert(VBA_PROJECT_PART.into(), b);
         r.read_vba_related(&v);
     }
     r.keep_custom_xml(&root_rels, &rels);
@@ -558,6 +574,8 @@ impl Reader<'_> {
         let types = self.content_types.get_or_insert_with(|| ContentTypes::read(pkg));
         let mut manifest = String::new();
         let mut kept = 0usize;
+        // Lowercased name → the spelling kept: case variants name one part, kept once.
+        let mut spelled: HashMap<String, String> = HashMap::new();
         for rel in self.pkg.rels(project).list.iter().filter(|r| !r.external) {
             // Part names compare case-insensitively (OPC): `/WORD/x` names the part the writer
             // stores as `word/x`.
@@ -566,6 +584,7 @@ impl Reader<'_> {
                 (Some(dir), Some(rest)) if dir.eq_ignore_ascii_case("word/") => format!("word/{rest}"),
                 _ => target.to_string(),
             };
+            let path = spelled.entry(path.to_ascii_lowercase()).or_insert(path).clone();
             let path = path.as_str();
             let ct = types.of(path).unwrap_or("application/octet-stream");
             let usable = path.strip_prefix("word/").is_some_and(|t| !t.is_empty())
@@ -577,7 +596,7 @@ impl Reader<'_> {
                 log::warn!("docx: not carrying VBA-related part {path:?}");
                 continue;
             }
-            let Some(bytes) = self.pkg.get(path) else {
+            let Some(bytes) = self.pkg.shared(path) else {
                 log::warn!("docx: VBA-related part {path} is missing; keeping the project without it");
                 continue;
             };
@@ -587,7 +606,7 @@ impl Reader<'_> {
             }
             kept += 1;
             manifest.push_str(&format!("{}\t{path}\t{ct}\n", rel.kind));
-            self.doc.passthrough.entry(path.to_string()).or_insert_with(|| Arc::new(bytes.to_vec()));
+            self.doc.passthrough.entry(path.to_string()).or_insert(bytes);
         }
         if !manifest.is_empty() {
             self.doc.passthrough.insert(VBA_RELATED.into(), Arc::new(manifest.into_bytes()));
@@ -639,12 +658,15 @@ impl Reader<'_> {
         if rel.external {
             return None;
         }
-        if let Some(k) = self.media_by_path.get(&rel.target) {
+        // Keyed by the stored name: case variants of a target name the same part (OPC).
+        let pkg = self.pkg;
+        let path = pkg.canonical(&rel.target)?;
+        if let Some(k) = self.media_by_path.get(path) {
             return Some(k.clone());
         }
-        let bytes = self.pkg.get(&rel.target)?;
+        let bytes = pkg.shared(path)?;
         let base: String =
-            rel.target.rsplit('/').next().unwrap_or("image").chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
+            path.rsplit('/').next().unwrap_or("image").chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
         let base = if base.is_empty() || base.starts_with('.') { format!("image{base}") } else { base };
         let mut key = base.clone();
         let mut n = 1;
@@ -655,22 +677,36 @@ impl Reader<'_> {
                 None => format!("{base}_{n}"),
             };
         }
-        self.doc.media.insert(key.clone(), Arc::new(bytes.to_vec()));
-        self.media_by_path.insert(rel.target.clone(), key.clone());
+        self.doc.media.insert(key.clone(), bytes);
+        self.media_by_path.insert(path.to_string(), key.clone());
         Some(key)
     }
 
     /// A chart or diagram part, parsed once however often it's referenced (`None` when unreadable).
     fn graphic_part(&mut self, path: &str) -> Option<Arc<El>> {
+        let pkg = self.pkg;
+        let path = pkg.canonical(path)?;
         if let Some(p) = self.graphic_parts.get(path) {
             return p.clone();
         }
-        let p = self.xml(path).ok().flatten().map(Arc::new);
+        let size = pkg.get(path).map_or(0, <[u8]>::len);
+        let p = match self.graphic_part_bytes.checked_sub(size) {
+            Some(left) => {
+                self.graphic_part_bytes = left;
+                self.xml(path).ok().flatten().map(Arc::new)
+            }
+            None => {
+                log::warn!("docx: chart and diagram parts past {MAX_GRAPHIC_PART_BYTES} bytes are left unread ({path})");
+                None
+            }
+        };
         self.graphic_parts.insert(path.to_string(), p.clone());
         p
     }
 
     pub fn load_header_footer(&mut self, path: &str, footer: bool) -> Option<u32> {
+        let pkg = self.pkg;
+        let path = pkg.canonical(path).unwrap_or(path);
         if let Some(id) = self.hf_by_path.get(path) {
             return Some(*id);
         }
@@ -1049,8 +1085,8 @@ impl Reader<'_> {
 
     fn read_settings(&mut self, path: &str) -> Result<(), DocxError> {
         let Some(root) = self.xml(path)? else { return Ok(()) };
-        if let Some(b) = self.pkg.get(path).filter(|b| crate::write::settings_has_unowned(b)) {
-            self.doc.passthrough.insert(crate::package::SETTINGS_ORIG.into(), Arc::new(b.to_vec()));
+        if let Some(b) = self.pkg.shared(path).filter(|b| crate::write::settings_has_unowned(b)) {
+            self.doc.passthrough.insert(crate::package::SETTINGS_ORIG.into(), b);
         }
         let rels = self.pkg.rels(path);
         let s = &mut self.doc.settings;
