@@ -25,6 +25,9 @@ const MAX_CELLS: usize = 100_000;
 const MAX_LABEL: usize = 200;
 /// Most axis ticks drawn.
 const MAX_TICKS: usize = 20;
+/// Longest number format code used (characters; a spreadsheet's own limit). A longer one is
+/// ignored: values show as stored rather than being formatted once per tick and label.
+const MAX_FORMAT_CODE: usize = 255;
 /// Default text size, points.
 const FONT: f32 = 9.0;
 /// Average character width estimate, em (charts and diagrams measure text before shaping).
@@ -459,7 +462,7 @@ fn labels(el: Option<&El>, cap: usize, date1904: bool) -> Vec<String> {
     let Some(cache) = el.find("c:strCache").or_else(|| el.find("c:numCache")).or_else(|| el.find("c:strLit")).or_else(|| el.find("c:numLit")) else {
         return Vec::new();
     };
-    let code = cache.child("c:formatCode").map(|f| f.text()).filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("General"));
+    let code = cache.child("c:formatCode").map(|f| f.text()).filter(|f| format_code_ok(f) && !f.eq_ignore_ascii_case("General"));
     pts(cache, cap)
         .into_iter()
         .map(|p| {
@@ -486,9 +489,14 @@ fn numbers(el: Option<&El>, cap: usize) -> (Vec<Option<f64>>, Option<String>) {
     let Some(cache) = el.and_then(|e| e.find("c:numCache").or_else(|| e.find("c:numLit"))) else {
         return (Vec::new(), None);
     };
-    let fmt = cache.child("c:formatCode").map(|f| f.text()).filter(|f| !f.is_empty());
+    let fmt = cache.child("c:formatCode").map(|f| f.text()).filter(|f| format_code_ok(f));
     let vals = pts(cache, cap).into_iter().map(|p| p.and_then(|t| t.trim().parse::<f64>().ok()).filter(|v| v.is_finite())).collect();
     (vals, fmt)
+}
+
+/// Is `code` a number format code worth using: not empty, nor longer than [`MAX_FORMAT_CODE`]?
+fn format_code_ok(code: &str) -> bool {
+    !code.is_empty() && code.chars().nth(MAX_FORMAT_CODE).is_none()
 }
 
 /// The `c:pt` texts of a cache by index. Indexes and counts from the file are capped.
@@ -522,7 +530,12 @@ fn axis(a: Option<&El>) -> Axis {
         mid: a.child("c:crossBetween").and_then(|c| c.attr("val")) == Some("midCat"),
         min: num("c:min"),
         max: num("c:max"),
-        fmt: a.child("c:numFmt").filter(|f| f.attr("sourceLinked") != Some("1")).and_then(|f| f.attr("formatCode")).map(str::to_string),
+        fmt: a
+            .child("c:numFmt")
+            .filter(|f| f.attr("sourceLinked") != Some("1"))
+            .and_then(|f| f.attr("formatCode"))
+            .filter(|f| format_code_ok(f))
+            .map(str::to_string),
     }
 }
 
@@ -1970,9 +1983,35 @@ mod tests {
         assert_eq!(cat("mmm-yy"), ["Jan-24", "Feb-24"]);
         assert_eq!(cat("yyyy"), ["2024", "2024"]);
         assert_eq!(cat("0.00"), ["45292.00", "45323.00"]);
+        // WC-25: a format code past a spreadsheet's 255 characters is ignored, not tokenised
+        // once per label.
+        let long = format!("0.00{}", "\\x".repeat(200));
+        assert_eq!(cat(&long), ["45292", "45323"]);
         let ymd = |v: f64| excel_stamp(v, false).map(|t| (t.y, t.m, t.d));
         assert_eq!(ymd(61.0), Some((1900, 3, 1)));
         assert_eq!(ymd(45292.0), Some((2024, 1, 1)));
+    }
+
+    /// WC-25: value and axis format codes longer than [`MAX_FORMAT_CODE`] are dropped where
+    /// they're read; codes up to it are kept.
+    #[test]
+    fn overlong_format_codes_are_ignored() {
+        let cache = |code: &str| {
+            let x = format!(
+                r#"<c:val {NS}><c:numCache><c:formatCode>{code}</c:formatCode><c:ptCount val="1"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:val>"#
+            );
+            numbers(Some(&crate::xml::parse(x.as_bytes()).unwrap()), 10).1
+        };
+        let fits = "0".repeat(MAX_FORMAT_CODE);
+        assert_eq!(cache(&fits).as_deref(), Some(fits.as_str()));
+        assert_eq!(cache(&"0".repeat(MAX_FORMAT_CODE + 1)), None);
+        assert_eq!(cache(&"0".repeat(1_000_000)), None);
+        let ax = |code: &str| {
+            let x = format!(r#"<c:valAx {NS}><c:numFmt formatCode="{code}" sourceLinked="0"/></c:valAx>"#);
+            axis(Some(&crate::xml::parse(x.as_bytes()).unwrap())).fmt
+        };
+        assert_eq!(ax("0.0").as_deref(), Some("0.0"));
+        assert_eq!(ax(&"#".repeat(100_000)), None);
     }
 
     #[test]
