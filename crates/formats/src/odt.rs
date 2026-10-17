@@ -39,6 +39,9 @@ const MAX_REGIONS: usize = 10_000;
 const MAX_OPEN_INSERTIONS: usize = 64;
 /// Longest change author or date kept, in characters.
 const MAX_INFO_CHARS: usize = 256;
+/// Most spaces all the `text:s` of a document stand for together. One tag is up to 1000 and
+/// compresses to almost nothing, so without a total a few KB expand to gigabytes.
+const MAX_SPACES: usize = 4 << 20;
 
 // ---------------------------------------------------------------------------------------------
 // Export
@@ -1349,6 +1352,8 @@ struct Body<'a> {
     del: Option<DelState>,
     /// Insertions open in the body: (region id, revision).
     active_ins: Vec<(String, RevMark)>,
+    /// What is left of [`MAX_SPACES`].
+    spaces_left: usize,
 }
 
 impl Body<'_> {
@@ -1673,7 +1678,9 @@ impl Body<'_> {
                 self.fmt.push(f);
             }
             "s" => {
-                let n = get(a, "text:c").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 1000);
+                // Once the document's budget is spent a tag is one space, no more than its own size.
+                let n = get(a, "text:c").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 1000).min(self.spaces_left).max(1);
+                self.spaces_left = self.spaces_left.saturating_sub(n);
                 self.push_text(&" ".repeat(n));
             }
             "tab" => self.push_text("\t"),
@@ -2198,6 +2205,7 @@ fn parse_tracked(bytes: &[u8]) -> Result<(Flow, SectionProps, Option<bool>), Str
         info_field: None,
         del: None,
         active_ins: Vec::new(),
+        spaces_left: MAX_SPACES,
     };
     events(&content, |ev| match ev {
         Ev::Start(q, a) => {
@@ -2465,6 +2473,28 @@ mod tests {
 
     fn paras(f: &Flow) -> Vec<&Para> {
         f.blocks.iter().filter_map(|b| if let FBlock::Para(p) = b { Some(p) } else { None }).collect()
+    }
+
+    #[test]
+    fn space_runs_have_a_document_budget() {
+        // #2748: each `text:s` was capped at 1000 spaces but the total wasn't, so a 6 KB file
+        // grew to over 100 MB and a larger one aborted out of memory. Past the budget a tag is
+        // one space.
+        let tags = 10_000;
+        let content = format!(
+            r#"<office:document-content {NS_T}><office:body><office:text><text:p>b<text:s text:c="3"/>c</text:p><text:p>a{}x</text:p><text:p>d<text:s text:c="3"/>e</text:p></office:text></office:body></office:document-content>"#,
+            r#"<text:s text:c="1000"/>"#.repeat(tags)
+        );
+        let flow = parse(&zip_of(&[("content.xml", content.as_bytes())])).unwrap();
+        let ps = paras(&flow);
+        assert_eq!(ps[0].text(), "b   c");
+        let text = ps[1].text();
+        // The tags that fit whole, the one that spends the rest, then one space per tag.
+        let used = MAX_SPACES - 3;
+        let fit = used / 1000 + 1;
+        assert_eq!(text.len(), 2 + used + (tags - fit));
+        assert!(text.starts_with("a ") && text.ends_with(" x"));
+        assert_eq!(ps[2].text(), "d e");
     }
 
     #[test]
