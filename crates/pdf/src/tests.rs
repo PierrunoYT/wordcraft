@@ -167,6 +167,35 @@ fn exports_pages_text_and_structure() {
     assert!(raw.contains("D:20240506070809"), "creation date");
 }
 
+/// WC-20 (#2762): a hyperlink to a script, a `file:` path, a UNC share or another scheme is not
+/// written as a PDF link (a click would run it or leak NTLM hashes); web links still are.
+#[test]
+fn unsafe_link_targets_are_not_exported() {
+    let mut d = Document::new();
+    let mut p = Paragraph::with_text("Links: ", CharProps::default());
+    for (i, target) in [
+        "javascript:alert(1)",
+        "JavaScript:alert(2)",
+        "\\\\attackerunc\\share\\x",
+        "//attackerslash/share",
+        "file:///C:/Users/Public/attackerfile.exe",
+        "ms-msdt:/id attackermsdt",
+        "https://example.com/ok",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let n = p.len();
+        p.insert_text(n, &format!(" item{i}"), &CharProps { link: Some((*target).into()), ..Default::default() }).unwrap();
+    }
+    d.body = vec![para_block(p)];
+    let raw = String::from_utf8_lossy(&export(&d, &PdfOptions { compress: false, ..Default::default() }).unwrap()).into_owned();
+    for bad in ["javascript", "JavaScript", "attackerunc", "attackerslash", "attackerfile", "attackermsdt", "ms-msdt"] {
+        assert!(!raw.contains(bad), "{bad} written into the PDF");
+    }
+    assert!(raw.contains("/URI (https://example.com/ok)") || raw.contains("/URI(https://example.com/ok)"), "web link kept");
+}
+
 #[test]
 fn page_selection_and_errors() {
     let d = sample();

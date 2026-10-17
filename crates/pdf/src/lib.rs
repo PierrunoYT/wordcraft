@@ -1464,8 +1464,10 @@ impl Exporter<'_> {
                     None => continue,
                 }
             } else {
+                // A script, `file:`/UNC path or other non-web target is not linked (WC-20), the
+                // way every other exporter filters it: a click would run it or leak NTLM hashes.
                 let url = target.trim();
-                if url.is_empty() {
+                if url.is_empty() || !wordcraft_doc::link::is_safe_href(url) {
                     continue;
                 }
                 Target::Action(Action::Link(LinkAction::new(url.to_string())))
