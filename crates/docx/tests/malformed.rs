@@ -265,3 +265,40 @@ fn long_header_reference_chain_is_cut_off() {
     assert!(!d.parts.is_empty());
     assert!(d.parts.len() <= 8, "followed {} chained headers", d.parts.len());
 }
+
+/// WC-39: inline markup nested as deep as the XML parser allows (256 levels: hyperlinks,
+/// revisions, smart tags, content controls…) reads and writes back on a thread with a 1 MB
+/// stack, the size of a Windows UI thread's, without overflowing it.
+#[test]
+fn deep_inline_nesting_fits_a_small_stack() {
+    const XML_DEPTH: usize = 256;
+    let wrappers: [(&str, &str); 6] = [
+        ("<w:hyperlink w:anchor=\"a\">", "</w:hyperlink>"),
+        ("<w:ins w:id=\"1\" w:author=\"x\">", "</w:ins>"),
+        ("<w:smartTag>", "</w:smartTag>"),
+        ("<w:sdt><w:sdtContent>", "</w:sdtContent></w:sdt>"),
+        ("<w:dir w:val=\"rtl\">", "</w:dir>"),
+        ("<w:customXml>", "</w:customXml>"),
+    ];
+    // document, body, p; then the wrappers; then r and t.
+    let (mut open, mut close, mut depth) = (String::new(), Vec::new(), 3usize);
+    for (open_tag, close_tag) in wrappers.iter().cycle() {
+        let levels = open_tag.matches('<').count();
+        if depth + levels + 2 > XML_DEPTH {
+            break;
+        }
+        depth += levels;
+        open.push_str(open_tag);
+        close.push(*close_tag);
+    }
+    close.reverse();
+    let x = format!("<w:document {W_NS}><w:body><w:p>{open}<w:r><w:t>deep</w:t></w:r>{}</w:p></w:body></w:document>", close.concat());
+    let z = doc_zip(x.as_bytes());
+    let worker = std::thread::Builder::new().stack_size(1024 * 1024).spawn(move || {
+        let d = read(&z).unwrap();
+        assert!(d.plain_text(wordcraft_doc::StoryRef::Body).contains("deep"));
+        write(&d).unwrap();
+    });
+    worker.unwrap().join().expect("reading or writing overflowed a 1 MB stack");
+    assert!(depth > 250, "only {depth} levels were tested");
+}

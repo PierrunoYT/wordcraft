@@ -15,6 +15,12 @@ use crate::DocxError;
 pub const MAX_DEPTH: usize = 256;
 /// Maximum number of elements in one part.
 pub const MAX_ELEMENTS: usize = 8_000_000;
+/// Maximum number of attributes on one element (namespace declarations included). Real markup
+/// carries a few dozen at most; a flood of (duplicate) attributes is refused, not allocated.
+pub const MAX_ATTRS: usize = 1024;
+/// Maximum number of attributes kept from one part, so many elements with many attributes each
+/// can't build a tree many times the size of the part either.
+pub const MAX_PART_ATTRS: usize = 16_000_000;
 
 /// Known namespaces and the canonical prefix we use for them (read and write).
 pub const NAMESPACES: &[(&str, &str)] = &[
@@ -263,6 +269,11 @@ pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
 /// [`parse`] with `extra` namespaces (prefix, URI) mapped to canonical prefixes first, so a
 /// related vocabulary (WordprocessingML 2003) reads with the prefixes the reader knows.
 pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, DocxError> {
+    parse_limited(bytes, extra, MAX_PART_ATTRS)
+}
+
+/// [`parse_ns`] keeping at most `max_attrs` attributes in all.
+fn parse_limited(bytes: &[u8], extra: &[(&'static str, &str)], max_attrs: usize) -> Result<El, DocxError> {
     // UTF-16 (with a BOM) is transcoded to UTF-8; a UTF-8 BOM is stripped.
     let transcoded = utf16_to_utf8(bytes);
     let bytes = match &transcoded {
@@ -280,6 +291,7 @@ pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, Docx
     let mut stack: Vec<El> = Vec::new();
     let mut root: Option<El> = None;
     let mut count = 0usize;
+    let mut attrs_total = 0usize;
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -300,7 +312,10 @@ pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, Docx
                     None => local,
                 };
                 let mut el = El { name, attrs: Vec::new(), kids: Vec::new() };
-                for a in e.attributes().with_checks(false) {
+                for (i, a) in e.attributes().with_checks(false).enumerate() {
+                    if i >= MAX_ATTRS {
+                        return Err(DocxError::Limit("too many attributes on one XML element".into()));
+                    }
                     let Ok(a) = a else { continue };
                     let key = a.key;
                     let raw_key = key.as_ref();
@@ -339,6 +354,10 @@ pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, Docx
                     } else {
                         val
                     };
+                    attrs_total += 1;
+                    if attrs_total > max_attrs {
+                        return Err(DocxError::Limit("too many XML attributes".into()));
+                    }
                     el.attrs.push((aname, val));
                 }
                 if matches!(ev, Event::Start(_)) {
@@ -394,6 +413,101 @@ pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, Docx
         attach(&mut stack, &mut root, el);
     }
     root.ok_or_else(|| DocxError::Xml("no root element".into()))
+}
+
+/// Is `xml` well-formed element content (XML 1.0 `content`), with at least one element, that
+/// can be written verbatim into a part? Unlike [`parse`], which reads what it can of a broken
+/// part, this is strict: every element is closed by a matching end tag, no end tag comes without
+/// its start, attributes are unique, references are well-formed, and there are no declarations,
+/// doctypes, processing instructions or characters XML can't carry. Prefixes aren't resolved
+/// (the part being written declares them). Bounded like [`parse`].
+pub fn validate_fragment(xml: &str) -> Result<(), DocxError> {
+    fn ill(what: &str) -> DocxError {
+        DocxError::Xml(format!("not well-formed: {what}"))
+    }
+    fn chars_ok(b: &[u8]) -> bool {
+        std::str::from_utf8(b).is_ok_and(|s| s.chars().all(xml_char_ok))
+    }
+    /// A start or empty tag: its name and attributes, counted against the element limit.
+    fn check_start(e: &quick_xml::events::BytesStart, count: &mut usize) -> Result<(), DocxError> {
+        *count += 1;
+        if *count > MAX_ELEMENTS {
+            return Err(DocxError::Limit("too many XML elements".into()));
+        }
+        if !chars_ok(e.name().as_ref()) {
+            return Err(ill("element name"));
+        }
+        for (i, a) in e.attributes().with_checks(true).enumerate() {
+            if i >= MAX_ATTRS {
+                return Err(DocxError::Limit("too many attributes on one XML element".into()));
+            }
+            let a = a.map_err(|e| ill(&e.to_string()))?;
+            if !chars_ok(a.key.as_ref()) || !chars_ok(&a.value) || a.value.contains(&b'<') {
+                return Err(ill("attribute"));
+            }
+            a.normalized_value(XmlVersion::Explicit1_0).map_err(|e| ill(&e.to_string()))?;
+        }
+        Ok(())
+    }
+    let mut r = quick_xml::Reader::from_str(xml);
+    {
+        let c = r.config_mut();
+        c.trim_text_start = false;
+        c.trim_text_end = false;
+        c.check_end_names = true;
+        c.check_comments = true;
+        c.allow_unmatched_ends = false;
+        c.allow_dangling_amp = false;
+    }
+    let mut depth = 0usize;
+    let mut count = 0usize;
+    loop {
+        match r.read_event().map_err(|e| ill(&e.to_string()))? {
+            Event::Start(e) => {
+                check_start(&e, &mut count)?;
+                depth += 1;
+                if depth > MAX_DEPTH {
+                    return Err(DocxError::Limit("XML nesting too deep".into()));
+                }
+            }
+            Event::Empty(e) => check_start(&e, &mut count)?,
+            Event::End(_) => depth = depth.checked_sub(1).ok_or_else(|| ill("unmatched end tag"))?,
+            Event::Text(t) => {
+                if !chars_ok(&t) || t.windows(3).any(|w| w == b"]]>") {
+                    return Err(ill("character"));
+                }
+            }
+            Event::CData(t) => {
+                if !chars_ok(&t) {
+                    return Err(ill("character"));
+                }
+            }
+            Event::Comment(t) => {
+                if !chars_ok(&t) {
+                    return Err(ill("character"));
+                }
+            }
+            Event::GeneralRef(g) => {
+                let known = match g.resolve_char_ref() {
+                    Ok(Some(c)) => xml_char_ok(c),
+                    Ok(None) => g.decode().is_ok_and(|n| quick_xml::escape::resolve_predefined_entity(&n).is_some()),
+                    Err(_) => false,
+                };
+                if !known {
+                    return Err(ill("reference"));
+                }
+            }
+            Event::Decl(_) | Event::PI(_) | Event::DocType(_) => return Err(ill("declaration")),
+            Event::Eof => break,
+        }
+    }
+    if depth != 0 {
+        return Err(ill("unclosed element"));
+    }
+    if count == 0 {
+        return Err(ill("no element"));
+    }
+    Ok(())
 }
 
 fn push_text(top: &mut El, s: &str) {
@@ -567,6 +681,62 @@ mod tests {
         }
         s.push_str("><b/></a>");
         assert!(parse(s.as_bytes()).is_err());
+    }
+
+    /// WC-06: one element carrying a flood of (duplicate) attributes is refused instead of
+    /// building a tree many times the size of the part, and so are many elements that each stay
+    /// under the per-element cap but add up.
+    #[test]
+    fn attribute_floods_are_refused() {
+        let flood = |n: usize| format!("<w:p{}/>", " a=\"\"".repeat(n));
+        assert!(parse(flood(MAX_ATTRS).as_bytes()).is_ok());
+        assert!(matches!(parse(flood(MAX_ATTRS + 1).as_bytes()), Err(DocxError::Limit(_))));
+        assert!(matches!(parse(flood(200_000).as_bytes()), Err(DocxError::Limit(_))));
+        let many = format!("<r>{}</r>", flood(1000).repeat(20));
+        assert!(parse_limited(many.as_bytes(), &[], 20_000).is_ok());
+        assert!(matches!(parse_limited(many.as_bytes(), &[], 19_999), Err(DocxError::Limit(_))));
+    }
+
+    /// WC-39: the gate in front of verbatim re-emitted markup is strict, where `parse` is lenient.
+    #[test]
+    fn validate_fragment_is_strict() {
+        for ok in [
+            "<w:r><w:t>raw &amp; &#65;</w:t></w:r>",
+            "<vt:lpwstr>x</vt:lpwstr>",
+            "<a/><b x='1' y=\"2\"/><!-- note --><![CDATA[<x>]]>",
+            "<m:oMath><m:r><m:t>x</m:t></m:r></m:oMath>",
+        ] {
+            assert!(validate_fragment(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "text only",
+            "<a>",
+            "<a></b>",
+            "<w:r/></w:p><w:p>",
+            "<a></a></a>",
+            "<a x='1' x='2'/>",
+            "<a x='<'/>",
+            "<a>&nope;</a>",
+            "<a>&#0;</a>",
+            "<a>& b</a>",
+            "<a>\u{1}</a>",
+            "<a>]]></a>",
+            "<?xml version=\"1.0\"?><a/>",
+            "<!DOCTYPE a><a/>",
+            "<a><?pi x?></a>",
+            "<a><!-- -- --></a>",
+            "<broken",
+        ] {
+            assert!(validate_fragment(bad).is_err(), "{bad:?}");
+            // The lenient parser accepts some of these, which is why it can't be the gate.
+            let _ = parse(bad.as_bytes());
+        }
+        assert!(parse(b"<w:r/></w:p><w:p>").is_ok());
+        let deep = format!("{}{}", "<a>".repeat(MAX_DEPTH + 1), "</a>".repeat(MAX_DEPTH + 1));
+        assert!(matches!(validate_fragment(&deep), Err(DocxError::Limit(_))));
+        let wide = format!("<a{}/>", " x=\"\"".repeat(MAX_ATTRS + 1));
+        assert!(validate_fragment(&wide).is_err());
     }
 
     #[test]

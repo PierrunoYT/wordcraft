@@ -64,10 +64,9 @@ pub fn write(props: &[CustomProp]) -> Vec<u8> {
     w.into_bytes()
 }
 
-/// A raw value is written only if it parses inside a `vt`-namespaced wrapper.
+/// A raw value is written only if it is well-formed element content (the part declares `vt`).
 fn raw_is_wellformed(xml: &str) -> bool {
-    let doc = format!(r#"<x xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">{xml}</x>"#);
-    crate::xml::parse(doc.as_bytes()).is_ok()
+    crate::xml::validate_fragment(xml).is_ok()
 }
 
 /// Serialise an element with its canonical prefixes.

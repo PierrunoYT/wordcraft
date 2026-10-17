@@ -781,7 +781,7 @@ impl Writer<'_> {
                 self.rev_close(w, props);
             }
             InlineObject::Opaque { format, xml, text } => {
-                if format == "docx" && crate::xml::parse(xml.as_bytes()).is_ok() {
+                if format == "docx" && crate::xml::validate_fragment(xml).is_ok() {
                     w.raw(xml);
                 } else if !text.is_empty() {
                     self.rev_open(w, props);
