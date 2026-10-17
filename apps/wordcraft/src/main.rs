@@ -5,13 +5,18 @@
 //! `--control <port>` (or `WORDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server:
 //! `{"id":1,"key":"…","method":"engine.execute","params":{"command":"text.insert","params":{"text":"Hi"}}}`.
 //! Every request needs the key the app writes to `<settings>/control-key.<instance>` (mode 0600,
-//! removed on exit). See `docs/control-protocol.md`.
+//! removed on exit). See `docs/control-protocol.md`. `--automation-read-root DIR` and
+//! `--automation-write-root DIR` hold the control channel's requests to those folders, as they
+//! hold `wordcraft-cli mcp`'s.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod animations;
 #[cfg(target_os = "macos")]
 mod apple_events;
+// The root flags parse exactly as `wordcraft-cli mcp` parses them: one parser for both.
+#[path = "../../wordcraft-cli/src/automation_args.rs"]
+mod automation_args;
 mod clipboard;
 mod control_server;
 mod default_apps;
@@ -267,12 +272,15 @@ const USAGE: &str = "\
 wordcraft — the WordCraft desktop app
 
 USAGE:
-  wordcraft [--sample] [--control PORT] [FILE…]
+  wordcraft [--sample] [--control PORT [--automation-read-root DIR] [--automation-write-root DIR]] [FILE…]
 
 OPTIONS:
   --sample            open the sample document
   --control PORT      start the localhost control server on PORT, for agents and scripts
                       (or set WORDCRAFT_CONTROL_PORT); see docs/control-protocol.md
+  --automation-read-root DIR, --automation-write-root DIR
+                      hold control requests to these folders: files they read must be
+                      inside the read root, files they write inside the write root
   --version           print the version
   -h, --help          print this help
 ";
@@ -289,7 +297,7 @@ fn text_args() -> (Vec<String>, Vec<std::path::PathBuf>) {
     for (i, a) in std::env::args_os().skip(1).enumerate() {
         match a.into_string() {
             Ok(a) => args.push(a),
-            Err(a) if args.last().is_some_and(|p| p == "--control") => {
+            Err(a) if args.last().is_some_and(|p| matches!(p.as_str(), "--control" | "--automation-read-root" | "--automation-write-root")) => {
                 // Unlike `eprintln!`, never panics.
                 let (n, lossy) = (i + 1, a.to_string_lossy());
                 let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("wordcraft: argument {n} is not valid Unicode: {lossy}\n"));
@@ -299,6 +307,24 @@ fn text_args() -> (Vec<String>, Vec<std::path::PathBuf>) {
         }
     }
     (args, files)
+}
+
+/// The folders the control channel's requests are held to (#2745): `None` without root flags.
+/// A malformed flag (`parse_error`), a root that isn't an existing folder, or roots without a
+/// control channel to hold (`control`) is an error.
+fn automation_roots(
+    parse_error: Option<String>,
+    args: automation_args::AutomationArgs,
+    control: bool,
+) -> Result<Option<std::sync::Arc<wordcraft_engine::file_access::AutomationRoots>>, String> {
+    if let Some(e) = parse_error {
+        return Err(e);
+    }
+    let roots = wordcraft_engine::file_access::AutomationRoots::new(args.read_root.as_deref(), args.write_root.as_deref())?;
+    if roots.is_some() && !control {
+        return Err("--automation-read-root and --automation-write-root hold the control channel's requests: give --control PORT too".into());
+    }
+    Ok(roots)
 }
 
 /// Open a file whose name isn't valid Unicode (#1440). `file.open` takes its path as text, so it
@@ -325,8 +351,19 @@ fn main() -> eframe::Result {
     let mut sample = false;
     let (args, other_files) = text_args();
     let mut bad_control: Option<Option<String>> = None;
+    let mut root_args = automation_args::AutomationArgs::new(None, None);
+    let mut bad_roots: Option<String> = None;
     let mut args = args.into_iter().peekable();
     while let Some(a) = args.next() {
+        // `--automation-read-root DIR` / `--automation-write-root DIR` (or `=DIR`), once each.
+        match root_args.consume(&a, &mut args) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                bad_roots.get_or_insert(e);
+                continue;
+            }
+        }
         match a.as_str() {
             // A flag after `--control` stays a flag; a bad or missing port is an error (#1426).
             "--control" => {
@@ -355,6 +392,14 @@ fn main() -> eframe::Result {
         let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("wordcraft: --control needs a port number from 1 to 65535{got}\n"));
         std::process::exit(2);
     }
+    // A malformed or missing root is an error, never a control channel left unconfined.
+    let automation_roots = match automation_roots(bad_roots, root_args, control_port.is_some()) {
+        Ok(roots) => roots,
+        Err(e) => {
+            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("wordcraft: {e}\n"));
+            std::process::exit(2);
+        }
+    };
     // The log file lives in the settings directory, next to the preferences; opened after the
     // arguments, so `--version` leaves no file behind. Records logged until now are written to it
     // first. Runs without preferences (agents' test runs) log to standard error only, so they
@@ -450,7 +495,11 @@ fn main() -> eframe::Result {
             if let Some(port) = control_port
                 && let Some((rx, file)) = control_server::start(port, cc.egui_ctx.clone(), wordcraft_control_key::settings_dir().as_deref())
             {
-                app = app.with_control(rx);
+                if let Some(roots) = &automation_roots {
+                    let show = |root: Option<&std::path::Path>| root.map_or_else(|| "none".to_string(), |r| r.display().to_string());
+                    log::info!("control requests confined: read root {}, write root {}", show(roots.read_root()), show(roots.write_root()));
+                }
+                app = app.with_control(rx).with_automation_roots(automation_roots.clone());
                 key_file = file;
             }
             // Nothing to open (no files, no sample, no control channel driving the editor): start
@@ -508,6 +557,31 @@ mod tests {
         // A file that can't be read is a warning, as one that fails to open by name is.
         open_non_unicode(&mut app, &dir.join(std::ffi::OsString::from_vec(b"gon\xe9.txt".to_vec())));
         assert_eq!(app.session.path.as_deref(), Some(path.as_path()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod automation_root_tests {
+    use super::{automation_args::AutomationArgs, automation_roots};
+
+    /// `wordcraft --control PORT --automation-read-root DIR --automation-write-root DIR` holds the
+    /// control channel to the folders; a malformed flag, a missing folder or roots without a
+    /// control channel stop the app instead of leaving it unconfined (#2745).
+    #[test]
+    fn root_flags_open_the_roots_or_refuse_to_start() {
+        let dir = std::env::temp_dir().join(format!("wc-app-roots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = |read: Option<&std::path::Path>, write: Option<&std::path::Path>| AutomationArgs::new(read.map(Into::into), write.map(Into::into));
+        assert!(automation_roots(None, args(None, None), true).unwrap().is_none(), "no flags: not confined to folders");
+        let roots = automation_roots(None, args(Some(&dir), None), true).unwrap().unwrap();
+        assert!(roots.read_root().is_some() && roots.write_root().is_none());
+        assert!(automation_roots(None, args(Some(&dir), None), false).unwrap_err().contains("give --control"));
+        assert!(automation_roots(None, args(None, Some(&dir.join("missing"))), true).unwrap_err().contains("automation write root"));
+        assert_eq!(
+            automation_roots(Some("--automation-read-root given twice".into()), args(None, None), true).unwrap_err(),
+            "--automation-read-root given twice"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

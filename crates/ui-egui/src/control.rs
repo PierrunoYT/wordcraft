@@ -312,10 +312,15 @@ pub fn save_screenshot(image: &egui::ColorImage, path: Option<&str>) -> Value {
     };
     #[cfg(target_arch = "wasm32")]
     let _ = (&png, path);
+    // Only a PNG file, never `~/.bashrc` (#2745), and through the engine's `io`, which holds a
+    // control request to the automation write root and refuses network paths.
+    if !std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
+        return json!({"ok": false, "error": "`path` must end in .png"});
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if let Err(e) = std::fs::write(path, &png) {
-            return json!({"ok": false, "error": format!("{path}: {e}")});
+        if let Err(e) = wordcraft_engine::io::write_file(path, &png) {
+            return json!({"ok": false, "error": e});
         }
     }
     json!({"ok": true, "result": {"path": path, "width": w, "height": h}})

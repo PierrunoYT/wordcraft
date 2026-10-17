@@ -55,17 +55,32 @@ config works across the suite) keep the agent to the folders you give it:
   its nearest existing folder's links are followed and the rest must be plain names, so `..` below a
   folder that doesn't exist is refused, as is a link that leads nowhere (writing through it would
   create its target). The result is compared with the root by whole folder names: `/work2/x` is not
-  inside `/work`. On Windows case is ignored, UNC paths (`\\server\share\...`) are resolved like
-  drive-letter ones, and device names (`CON`, `NUL`, `COM1`...) are refused.
+  inside `/work`. On Windows case is ignored and device names (`CON`, `NUL`, `COM1`...) are
+  refused. The file read or written is the one that was checked (the path with its links
+  followed), not the path as given.
+- Paths that name another machine or a device are refused by their spelling, before anything is
+  looked up (on Windows, looking one up connects to that machine and hands it your NTLM
+  credentials): `\\server\share\...`, `//server/share/...`, `\\?\UNC\...`, `\??\...` and `\\.\...`.
+  A network path is allowed only when the root itself is on a share (a UNC root); device paths
+  never. The headless server and the app's control channel refuse them without roots too.
 - A refused path is an ordinary tool error the agent can read and correct, for example
   `automation path rejected: outside the write root /work/project/out: /etc/x.docx` or
   `automation filesystem access is not granted: write authority is absent: /work/project/out/x.docx`.
 - The roots must be existing folders; a missing one stops the server with an error. Each flag is
   given once (`--flag <dir>` or `--flag=<dir>`).
 
-The flags confine the headless server; `--connect` with them is an error, since the server would
-otherwise talk to an app that isn't confined. WordCraft's desktop app has no equivalent flags yet,
-so a running app (`wordcraft --control`) is not confined.
+The flags confine the headless server; `--connect` with them is an error, since they would confine
+only the bridge, not the app it talks to. To confine a running app, give it the same flags:
+`wordcraft --control 7981 --automation-read-root /work/project --automation-write-root
+/work/project/out` holds every control-channel request (and so `mcp --connect`) to those folders;
+see [the control protocol](control-protocol.md#confining-file-access). What the person does in the
+window is not confined.
+
+`file.exportPng` (and `save_document` to a `.png`) writes only files whose name ends in `.png`.
+
+Without the flags, file access is not confined: an agent can open, and so read out with `get_text`,
+any document or text file the user can, and save over any file the user can write. Give the roots
+whenever the agent reads untrusted documents (a document can carry instructions for the agent).
 
 What the roots do not cover: commands that take no path (`text.insert`, `execute` of anything that
 works on the open document) can still read and change that document, and `get_text` and

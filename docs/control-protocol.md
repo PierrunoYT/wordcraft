@@ -48,6 +48,26 @@ any other host it sends no key, says so, and the app refuses its requests: to dr
 another machine, forward its port to `127.0.0.1` (for example `ssh -L 7981:127.0.0.1:7981 host`)
 and set `WORDCRAFT_CONTROL_KEY` to that app's key.
 
+## Confining file access
+
+```sh
+wordcraft --control 7981 --automation-read-root /work/project --automation-write-root /work/project/out
+```
+
+The two flags hold every control-channel request (and so `wordcraft-cli mcp --connect`) to those
+folders, as they hold the headless MCP server: files a request reads must lie inside the read
+root, files it writes (`file.save`, `file.exportPng`, `ui.screenshot` and `ui.render` with a `path`…)
+inside the write root. The rules are the [MCP server's](mcp.md#confining-file-access). Each flag
+is given once (`--flag DIR` or `--flag=DIR`), the roots must be existing folders, and they need
+`--control` (or `WORDCRAFT_CONTROL_PORT`): otherwise the app prints an error and exits with
+status 2. What the person does in the window is never confined.
+
+With or without roots, control requests may not name another machine or a device
+(`\\server\share\...`, `\\?\UNC\...`, `\??\...`, `\\.\...`): such a path is refused by its spelling,
+before anything is looked up, because on Windows looking it up would send the user's NTLM
+credentials to that machine. Without roots, nothing else is checked: a request can read and write
+any file the user can.
+
 ## Methods
 
 | Method | Params | Result |
@@ -64,8 +84,8 @@ and set `WORDCRAFT_CONTROL_KEY` to that app's key.
 | `ui.wheel` | `x`, `y`, `dy`, `dx?`, `unit?` (`point`/`line`/`page`), `phase?` (`start`/`move`/`end`), modifiers | mouse-wheel or trackpad scroll at window coordinates (`dy` < 0 scrolls down) |
 | `ui.key` | `key` (`B`, `Enter`, `Left`…), `shift?`, `alt?`, `cmd?` | key press through egui (shortcuts apply) |
 | `ui.text` | `text` | typed text through egui |
-| `ui.screenshot` | `path?` | PNG of the window: written to `path`, or without one returned as base64 `png` in the reply |
-| `ui.render` | `path?`, `page?` (1-based), `scale?` | PNG of a page, rendered by the engine: written to `path`, or without one returned as base64 `png` in the reply (never a fixed name in the shared temporary folder) |
+| `ui.screenshot` | `path?` (ends in `.png`) | PNG of the window: written to `path`, or without one returned as base64 `png` in the reply |
+| `ui.render` | `path?` (ends in `.png`), `page?` (1-based), `scale?` | PNG of a page, rendered by the engine: written to `path`, or without one returned as base64 `png` in the reply (never a fixed name in the shared temporary folder) |
 | `ui.parity` | — | feature-catalog parity |
 | `ui.resize` / `ui.focus` / `app.quit` | | window control |
 

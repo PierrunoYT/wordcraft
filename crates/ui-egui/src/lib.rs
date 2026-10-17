@@ -449,6 +449,11 @@ pub struct WordApp {
     /// macOS: the title bar's height and where its content starts, around the traffic lights.
     pub mac_titlebar: chrome::MacTitleBar,
     control_rx: Option<std::sync::mpsc::Receiver<ControlRequest>>,
+    /// The folders control-channel requests may read and write (`wordcraft --control …
+    /// --automation-read-root DIR --automation-write-root DIR`); `None`: not confined to folders.
+    /// Either way the channel runs as automation (`file_access::confine`): network and device
+    /// paths are refused.
+    automation_roots: Option<std::sync::Arc<wordcraft_engine::file_access::AutomationRoots>>,
     shot_token: u64,
     queued_shots: Vec<(u64, f64, u32)>,
     pending_shots: Vec<(u64, Option<String>, std::sync::mpsc::Sender<Value>, f64)>,
@@ -586,6 +591,7 @@ impl WordApp {
             integrated_titlebar: false,
             mac_titlebar: chrome::MacTitleBar::default(),
             control_rx: None,
+            automation_roots: None,
             shot_token: 0,
             queued_shots: Vec::new(),
             pending_shots: Vec::new(),
@@ -644,6 +650,12 @@ impl WordApp {
 
     pub fn with_control(mut self, rx: std::sync::mpsc::Receiver<ControlRequest>) -> Self {
         self.control_rx = Some(rx);
+        self
+    }
+
+    /// Hold control-channel requests to these folders (#2745); what the person does stays free.
+    pub fn with_automation_roots(mut self, roots: Option<std::sync::Arc<wordcraft_engine::file_access::AutomationRoots>>) -> Self {
+        self.automation_roots = roots;
         self
     }
 
@@ -2159,7 +2171,9 @@ impl WordApp {
         let Some(rx) = self.control_rx.take() else { return };
         while let Ok(req) = rx.try_recv() {
             let reply = req.reply.clone();
-            match control::handle(self, ctx, &req) {
+            // Every path a request names is checked as automation's (#2745, #2746).
+            let roots = self.automation_roots.clone();
+            match wordcraft_engine::file_access::confine(roots.as_ref(), || control::handle(self, ctx, &req)) {
                 control::Outcome::Done(v) => {
                     let _ = reply.send(v);
                 }
@@ -2210,7 +2224,10 @@ impl WordApp {
         for (token, image) in events {
             if let Some(i) = self.pending_shots.iter().position(|(t, ..)| *t == token) {
                 let (_, path, reply, _) = self.pending_shots.remove(i);
-                let _ = reply.send(control::save_screenshot(&image, path.as_deref()));
+                // A control request's file, written as automation's (#2745).
+                let roots = self.automation_roots.clone();
+                let saved = wordcraft_engine::file_access::confine(roots.as_ref(), || control::save_screenshot(&image, path.as_deref()));
+                let _ = reply.send(saved);
             }
         }
         let now = now_ms();
@@ -6617,6 +6634,49 @@ mod tests {
         assert_eq!(&png[..4], b"\x89PNG");
         assert_eq!(v["result"]["width"], 2, "{v}");
         assert_eq!(v["result"]["height"], 1, "{v}");
+        // A screenshot is written only as a PNG file (#2745).
+        let v = control::save_screenshot(&image, Some("profile.bashrc"));
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v["error"].as_str().is_some_and(|e| e.contains("must end in .png")), "{v}");
+    }
+
+    /// Control-channel requests run as automation (#2745, #2746): held to the folders given with
+    /// `--automation-read-root`/`--automation-write-root`, and never reaching a network share,
+    /// with roots or without.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn control_requests_are_held_to_the_automation_roots() {
+        let base = std::env::temp_dir().join(format!("wc-ui-control-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["out", "outside"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let ctx = egui::Context::default();
+        let ask = |a: &mut WordApp, tx: &std::sync::mpsc::Sender<ControlRequest>, command: &str, params: Value| {
+            let (req, reply) = ControlRequest::new("engine.execute", json!({"command": command, "params": params}));
+            tx.send(req).unwrap();
+            a.drain_control(&ctx);
+            reply.recv().unwrap()
+        };
+        let png = |dir: &str| base.join(dir).join("page.png").to_string_lossy().into_owned();
+        let roots = wordcraft_engine::file_access::AutomationRoots::new(None, Some(&base.join("out"))).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut a = typed().with_control(rx).with_automation_roots(roots);
+        let v = ask(&mut a, &tx, "file.exportPng", json!({"path": png("outside"), "scale": 0.2}));
+        assert!(v["error"].as_str().is_some_and(|e| e.contains("outside the write root")), "{v}");
+        assert!(!base.join("outside/page.png").exists());
+        let v = ask(&mut a, &tx, "file.exportPng", json!({"path": png("out"), "scale": 0.2}));
+        assert_eq!(v["ok"], true, "{v}");
+        let v = ask(&mut a, &tx, "file.open", json!({"path": png("outside")}));
+        assert!(v["error"].as_str().is_some_and(|e| e.contains("read authority is absent")), "{v}");
+        // Without roots, network paths are still refused, before anything is looked up.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut a = typed().with_control(rx);
+        let v = ask(&mut a, &tx, "file.open", json!({"path": r"\\192.0.2.1\s\x.docx"}));
+        assert!(v["error"].as_str().is_some_and(|e| e.contains("network paths are not allowed")), "{v}");
+        // What the person does is not automation: the same app reads outside any root.
+        assert_eq!(wordcraft_engine::file_access::check_read(&png("outside")), Ok(()));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// #821: Shift+F10 opens the page's context menu below the caret, like right-clicking there

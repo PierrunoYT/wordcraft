@@ -214,8 +214,12 @@ impl WordApp {
                 Ok(json!({"picked": true}))
             }
             AfterPick::Export { ext } => {
-                let Some(path) = picked else { return Ok(json!({"cancelled": true})) };
+                let Some(mut path) = picked else { return Ok(json!({"cancelled": true})) };
                 let r = if ext == "png" {
+                    // `file.exportPng` writes only `.png` files: a name typed without it gets it.
+                    if !std::path::Path::new(&path).extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
+                        path.push_str(".png");
+                    }
                     self.run("file.exportPng", json!({"path": path}))
                 } else if ext == crate::print_page::EXPORT_WORD_2003 {
                     self.run("file.saveAs", json!({"path": path, "format": ext}))
