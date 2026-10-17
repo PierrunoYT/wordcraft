@@ -43,7 +43,10 @@ cat ~/.config/wordcraft/control-key.local-7981   # Linux, outside Flatpak, port 
 
 `wordcraft-cli mcp --connect` takes the key from `WORDCRAFT_CONTROL_KEY`, or else from the key
 file for the port it connects to, and reads it again on every new connection (the app may have
-restarted). It sends the key only to loopback addresses (`127.0.0.0/8`, `::1`, `localhost`). For
+restarted). It sends the key only to `127.0.0.1`, the one address the app listens on: the
+`--connect` address must be `127.0.0.1` or `localhost` (which it takes as `127.0.0.1`, never `::1`),
+and the connection must really lead there. Other loopback addresses (`127.0.0.2`, `::1`) get no
+key, since any local user could listen on them. For
 any other host it sends no key, says so, and the app refuses its requests: to drive an app on
 another machine, forward its port to `127.0.0.1` (for example `ssh -L 7981:127.0.0.1:7981 host`)
 and set `WORDCRAFT_CONTROL_KEY` to that app's key.

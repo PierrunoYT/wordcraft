@@ -1,7 +1,7 @@
 //! Where MCP tool calls end up: a control-channel method call.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ pub struct Remote {
     addr: String,
     conn: Option<(BufReader<TcpStream>, TcpStream)>,
     next_id: u64,
-    /// The connection leads to a loopback address: requests carry the control key.
+    /// The connection leads to the app's address (`127.0.0.1`): requests carry the control key.
     send_key: bool,
     /// The control key, looked up once per connection (the app picks a new one at every start).
     key: Option<String>,
@@ -55,25 +55,43 @@ fn find_key(addr: &str) -> Result<String, String> {
     lookup_key(std::env::var("WORDCRAFT_CONTROL_KEY").ok(), wordcraft_control_key::settings_dir().as_deref(), port)
 }
 
-/// Whether `addr` (`HOST:PORT`, as given to `--connect`) names a loopback address: 127.0.0.0/8,
-/// ::1 or `localhost`. Other host names are not resolved: they never count.
-fn is_loopback_addr(addr: &str) -> bool {
-    let loopback = |ip: IpAddr| ip.to_canonical().is_loopback();
+/// The one address the app's control server listens on (`apps/wordcraft/src/control_server.rs`
+/// binds `127.0.0.1` only). The key goes to no other peer: any local user can bind `[::1]` or
+/// `127.0.0.2` on the same port without privileges.
+const APP_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+/// Whether `addr` (`HOST:PORT`, as given to `--connect`) names the app's address: `127.0.0.1`
+/// (also as `::ffff:127.0.0.1`) or `localhost`. Other host names are not resolved: they never
+/// count.
+fn names_app_host(addr: &str) -> bool {
+    let app = |ip: IpAddr| ip.to_canonical() == APP_HOST;
     if let Ok(sa) = addr.parse::<SocketAddr>() {
-        return loopback(sa.ip());
+        return app(sa.ip());
     }
     if let Ok(ip) = addr.parse::<IpAddr>() {
-        return loopback(ip);
+        return app(ip);
     }
     let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
     let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
-    host.parse::<IpAddr>().map_or_else(|_| host.eq_ignore_ascii_case("localhost"), loopback)
+    host.parse::<IpAddr>().map_or_else(|_| host.eq_ignore_ascii_case("localhost"), app)
 }
 
-/// The key goes only to a loopback `--connect` address, and only when the connection really
-/// leads to one (`peer`, so a `localhost` that resolves elsewhere gets no key either).
+/// The key goes only to a `--connect` address that names the app's address, and only when the
+/// connection really leads to `127.0.0.1` (`peer`).
 fn may_send_key(addr: &str, peer: Option<SocketAddr>) -> bool {
-    is_loopback_addr(addr) && peer.is_some_and(|p| p.ip().to_canonical().is_loopback())
+    names_app_host(addr) && peer.is_some_and(|p| p.ip().to_canonical() == APP_HOST)
+}
+
+/// The addresses to try for `addr`. `localhost` means `127.0.0.1` only: the app listens nowhere
+/// else, and a `localhost` that resolves to `::1` first would reach whoever listens there.
+fn targets(addr: &str) -> std::io::Result<Vec<SocketAddr>> {
+    if let Some((host, port)) = addr.rsplit_once(':')
+        && host.eq_ignore_ascii_case("localhost")
+    {
+        let port = port.parse::<u16>().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad port in {addr}")))?;
+        return Ok(vec![SocketAddr::new(APP_HOST, port)]);
+    }
+    Ok(addr.to_socket_addrs()?.collect())
 }
 
 impl Remote {
@@ -95,11 +113,11 @@ impl Remote {
         &self.addr
     }
 
-    /// Why requests go without the control key (the address is not loopback), if they do.
+    /// Why requests go without the control key (the address is not the app's), if they do.
     pub fn key_warning(&self) -> Option<String> {
         (!self.send_key).then(|| {
             format!(
-                "{} is not a loopback address, so the control key is not sent (it only goes to 127.0.0.0/8, ::1 and localhost) and the app refuses requests; reach the app through 127.0.0.1, for example with an SSH tunnel",
+                "{} is not 127.0.0.1 or localhost, so the control key is not sent (it only goes to 127.0.0.1, the one address the app listens on) and the app refuses requests; reach the app through 127.0.0.1, for example with an SSH tunnel",
                 self.addr
             )
         })
@@ -109,7 +127,7 @@ impl Remote {
         self.conn = None;
         self.key = None;
         let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, format!("cannot resolve {}", self.addr));
-        for sa in self.addr.to_socket_addrs()? {
+        for sa in targets(&self.addr)? {
             match TcpStream::connect_timeout(&sa, Duration::from_millis(800)) {
                 Ok(s) => {
                     s.set_nodelay(true).ok();
@@ -256,20 +274,24 @@ mod tests {
     }
 
     #[test]
-    fn key_only_for_loopback_addresses() {
+    fn key_only_for_the_apps_address() {
         let peer = |s: &str| s.parse::<SocketAddr>().ok();
         for (addr, at) in [
             ("127.0.0.1:7981", "127.0.0.1:7981"),
-            ("127.0.0.2:7981", "127.0.0.2:7981"),
-            ("[::1]:7981", "[::1]:7981"),
             ("[::ffff:127.0.0.1]:7981", "[::ffff:127.0.0.1]:7981"),
             ("localhost:7981", "127.0.0.1:7981"),
-            ("localhost:7981", "[::1]:7981"),
+            ("localhost:7981", "[::ffff:127.0.0.1]:7981"),
             ("LocalHost:7981", "127.0.0.1:7981"),
         ] {
             assert!(may_send_key(addr, peer(at)), "{addr} at {at}");
         }
         for (addr, at) in [
+            // Loopback, but not where the app listens (WC-03): any local user can bind these.
+            ("127.0.0.2:7981", "127.0.0.2:7981"),
+            ("[::1]:7981", "[::1]:7981"),
+            ("localhost:7981", "[::1]:7981"),
+            ("localhost:7981", "127.0.0.2:7981"),
+            ("127.0.0.1:7981", "[::1]:7981"),
             ("192.0.2.20:7981", "192.0.2.20:7981"),
             ("10.0.0.7:7981", "10.0.0.7:7981"),
             ("[fe80::1]:7981", "[fe80::1]:7981"),
@@ -287,11 +309,38 @@ mod tests {
         assert!(!may_send_key("127.0.0.1:7981", None));
     }
 
+    #[test]
+    fn localhost_means_127_0_0_1_only() {
+        // Never `::1` first (or at all), whatever the resolver says.
+        for addr in ["localhost:7981", "LOCALHOST:7981"] {
+            assert_eq!(targets(addr).unwrap(), vec!["127.0.0.1:7981".parse::<SocketAddr>().unwrap()], "{addr}");
+        }
+        assert!(targets("localhost:port").is_err());
+        assert!(targets("localhost:70000").is_err());
+        // Literal addresses stay as given (the key decision is separate).
+        assert_eq!(targets("[::1]:7981").unwrap(), vec!["[::1]:7981".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn no_key_to_a_listener_on_ipv6_loopback() {
+        // Another local user binds `[::1]` on the app's port (WC-03). Skip where there is no IPv6.
+        let Ok(listener) = TcpListener::bind(("::1", 0)) else { return };
+        let (port, seen) = fake_app_on(listener, |_| Some((json!({"ok": false, "error": "unauthorized"}), true)));
+        let finder: KeyFinder = Box::new(|_| Err("the key must not be read for [::1]".to_string()));
+        let mut r = Remote::connect_with(&format!("[::1]:{port}"), finder).unwrap();
+        assert!(r.key_warning().is_some());
+        assert!(r.call("document.inspect", json!({})).is_err());
+        assert!(seen.recv_timeout(WAIT).unwrap().get("key").is_none());
+    }
+
     /// A stand-in for the app on 127.0.0.1: every request line goes to the returned channel and
     /// gets `answer(request)`: a reply and whether to close the connection after it, or `None`
     /// to close it without a reply (the app quit).
     fn fake_app(answer: impl Fn(&Value) -> Option<(Value, bool)> + Send + Sync + 'static) -> (u16, Receiver<Value>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        fake_app_on(TcpListener::bind(("127.0.0.1", 0)).unwrap(), answer)
+    }
+
+    fn fake_app_on(listener: TcpListener, answer: impl Fn(&Value) -> Option<(Value, bool)> + Send + Sync + 'static) -> (u16, Receiver<Value>) {
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = channel();
         let answer = Arc::new(answer);
@@ -377,9 +426,9 @@ mod tests {
         let finder: KeyFinder = Box::new(|_| Err("the key must not be read for another host".to_string()));
         let mut r = Remote::connect_with(&format!("127.0.0.1:{port}"), finder).unwrap();
         r.send_key = false;
-        assert!(r.key_warning().is_some_and(|w| w.contains("not a loopback address")));
+        assert!(r.key_warning().is_some_and(|w| w.contains("not 127.0.0.1 or localhost")));
         let e = r.call("document.inspect", json!({})).unwrap_err();
-        assert!(e.contains("not a loopback address") && e.contains("not sent"), "{e}");
+        assert!(e.contains("not 127.0.0.1 or localhost") && e.contains("not sent"), "{e}");
         assert!(seen.recv_timeout(WAIT).unwrap().get("key").is_none());
     }
 }
