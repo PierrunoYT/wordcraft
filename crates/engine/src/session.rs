@@ -471,6 +471,30 @@ pub struct Session {
 /// The number of edit locations Go Back cycles through (Word: four).
 const EDIT_MARKS: usize = 4;
 
+/// Run `f` under the command safety net: a panic becomes `Err(Failed("{id} panicked: …"))`.
+/// (On `wasm32-unknown-unknown` panics abort, so there the net does nothing.)
+fn guarded<T>(id: &str, f: impl FnOnce() -> T) -> Result<T, CmdError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|p| {
+        let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+        #[cfg(test)]
+        CAUGHT_PANICS.with(|c| c.borrow_mut().push(format!("{id}: {msg}")));
+        CmdError::Failed(format!("{id} panicked: {msg}"))
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every panic the safety net caught on this thread, nested commands' included (their
+    /// errors may be swallowed by the outer command). Tests drain it with [`take_caught_panics`].
+    static CAUGHT_PANICS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The panics the safety net caught on this thread since the last call (tests).
+#[cfg(test)]
+pub(crate) fn take_caught_panics() -> Vec<String> {
+    CAUGHT_PANICS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 /// The equation being edited.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MathEdit {
@@ -1163,16 +1187,18 @@ impl Session {
 
     /// Run a command by id with JSON params (the single entry point for the UI, CLI, MCP and
     /// control channel). Mutating commands are undoable; a failed command leaves the document as
-    /// it was; a panic inside a command becomes an error.
+    /// it was; a panic inside a command (its `enabled` check, the protection check, its body or
+    /// the bookkeeping after it) becomes an error, with the document put back.
     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
         let join = std::mem::take(&mut self.join_next);
         let reg = self.registry.clone();
         let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };
-        if let Some(why) = (spec.enabled)(self) {
+        // Every step that runs command-specific code is guarded: a panic becomes an error.
+        if let Some(why) = guarded(id, || (spec.enabled)(self))? {
             return Err(CmdError::Disabled(format!("{id}: {why}")));
         }
         // Restrict Editing: refused outright, or allowed as long as it only edits the exceptions.
-        let guard = if spec.mutates { crate::cmd::protect::check_before(self, id, params)? } else { false };
+        let guard = if spec.mutates { guarded(id, || crate::cmd::protect::check_before(self, id, params))?? } else { false };
         if spec.mutates && self.doc.settings.protection.as_deref() == Some("trackedChanges") {
             self.doc.settings.track_changes = true;
         }
@@ -1238,24 +1264,19 @@ impl Session {
         let sel_before = self.sel.clone();
         let run = spec.run;
         let mutates = spec.mutates;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::cmd::column::dispatch(self, id, mutates, run, params)));
-        let mut result = match result {
-            Ok(r) => r,
-            Err(p) => {
-                let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
-                Err(CmdError::Failed(format!("{id} panicked: {msg}")))
-            }
-        };
-        // Restrict Editing: outside the exceptions nothing may change.
-        if result.is_ok()
-            && guard
-            && let Some((before, ..)) = &before_doc
-            && !crate::cmd::protect::outside_unchanged(before, &self.doc, &self.author)
-        {
-            result = Err(CmdError::Disabled(format!("{id}: only the editable regions of this protected document can change")));
-        }
-        match &result {
-            Ok(_) => {
+        let mut result = guarded(id, || crate::cmd::column::dispatch(self, id, mutates, run, params)).and_then(|r| r);
+        if result.is_ok() {
+            let dirty = self.dirty;
+            // The bookkeeping after a successful command is guarded too, so a panic in it also
+            // becomes an error with the document put back.
+            let post = guarded(id, || -> Result<(), CmdError> {
+                // Restrict Editing: outside the exceptions nothing may change.
+                if guard
+                    && let Some((before, ..)) = &before_doc
+                    && !crate::cmd::protect::outside_unchanged(before, &self.doc, &self.author)
+                {
+                    return Err(CmdError::Disabled(format!("{id}: only the editable regions of this protected document can change")));
+                }
                 if spec.mutates {
                     // Formatting changed while tracking becomes a formatting revision.
                     if let Some((before, ..)) = &before_doc {
@@ -1284,20 +1305,35 @@ impl Session {
                 if !matches!(id, "select.addObject" | "arrange.ungroup") && (spec.mutates || self.sel != sel_before) {
                     self.also_selected.clear();
                 }
-            }
-            Err(e) => {
-                if let Some((d, s, h, r, t, ev, c)) = before_doc {
-                    self.doc = d;
-                    self.sel = s;
-                    self.history = h;
-                    self.redo = r;
-                    self.typing_open = t;
-                    // The steps the command pushed out are back, so they no longer count as gone.
-                    self.undo_evicted = ev;
-                    self.column = c;
+                Ok(())
+            });
+            match post {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => result = Err(e),
+                Err(e) => {
+                    // Half-done bookkeeping: the document goes back below; what it may have
+                    // left half-set outside the snapshot goes back here.
+                    self.dirty = dirty;
+                    self.math = None;
+                    if before_doc.is_none() {
+                        self.sel = sel_before.clone();
+                    }
+                    result = Err(e);
                 }
-                self.status = e.to_string();
             }
+        }
+        if let Err(e) = &result {
+            if let Some((d, s, h, r, t, ev, c)) = before_doc {
+                self.doc = d;
+                self.sel = s;
+                self.history = h;
+                self.redo = r;
+                self.typing_open = t;
+                // The steps the command pushed out are back, so they no longer count as gone.
+                self.undo_evicted = ev;
+                self.column = c;
+            }
+            self.status = e.to_string();
         }
         result
     }

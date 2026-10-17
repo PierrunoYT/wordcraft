@@ -772,6 +772,7 @@ fn hostile_find_patterns_are_bounded() {
     for q in ["^", "^p^", "^u", "^99999999", "^0", "a^"] {
         let _ = s.run("edit.replaceAll", &json!({"text": q, "with": "^&^c\\9^p^", "wildcards": false}));
     }
+    assert_no_panic_caught();
 }
 
 #[test]
@@ -2688,9 +2689,87 @@ fn failed_command_leaves_document_unchanged() {
     assert_eq!(text(&s), before);
 }
 
+/// Fail if `r` (from `s.run(id, j)`) is a panic the safety net caught, or if any command it ran
+/// nested panicked (an outer command may swallow a nested command's error).
+#[track_caller]
+fn assert_no_caught_panic(id: &str, j: &serde_json::Value, r: &Result<serde_json::Value, crate::CmdError>) {
+    if let Some(e) = caught_panic(id, j, r) {
+        panic!("{e}");
+    }
+}
+
+/// Fail if the safety net caught a panic in any command this test thread ran.
+#[track_caller]
+fn assert_no_panic_caught() {
+    let caught = crate::session::take_caught_panics();
+    assert!(caught.is_empty(), "commands panicked: {caught:?}");
+}
+
+/// What [`assert_no_caught_panic`] would fail with.
+fn caught_panic(id: &str, j: &serde_json::Value, r: &Result<serde_json::Value, crate::CmdError>) -> Option<String> {
+    let caught = crate::session::take_caught_panics();
+    let t = j.to_string();
+    let shown = if t.len() > 300 { format!("{}... ({} bytes)", t.chars().take(300).collect::<String>(), t.len()) } else { t };
+    if !caught.is_empty() {
+        return Some(format!("{id} panicked on {shown}: {caught:?}"));
+    }
+    match r {
+        Err(crate::CmdError::Failed(m)) if m.contains(" panicked: ") => Some(format!("{id} panicked on {shown}: {m}")),
+        _ => None,
+    }
+}
+
+#[test]
+fn safety_net_turns_a_panic_into_an_error_and_restores_the_document() {
+    fn boom(s: &mut Session, _: &serde_json::Value) -> crate::CmdResult {
+        s.doc = wordcraft_doc::Document::new();
+        s.sel = crate::Selection::caret(Pos::body(0, 0));
+        panic!("boom")
+    }
+    fn bad_enabled(_: &Session) -> Option<&'static str> {
+        panic!("enabled boom")
+    }
+    let mut specs = cmd::registry().all().to_vec();
+    specs.push(crate::CommandSpec::new("test.boom", "Boom", "Test", boom));
+    specs.push(crate::CommandSpec::new("test.boomPure", "Boom", "Test", boom).pure());
+    specs.push(crate::CommandSpec::new("test.badEnabled", "Bad", "Test", |_, _| Ok(json!({}))).when(bad_enabled));
+    let mut s = Session::new(crate::sample::sample_document());
+    s.registry = std::sync::Arc::new(crate::Registry::new(specs));
+    run(&mut s, "text.insert", json!({"text": "kept "}));
+    let before = text(&s);
+    let (undo, dirty, sel) = (s.undo_depth(), s.dirty, s.sel.clone());
+    let _ = crate::session::take_caught_panics();
+    for id in ["test.boom", "test.badEnabled"] {
+        let r = s.run(id, &json!({}));
+        assert!(matches!(&r, Err(crate::CmdError::Failed(m)) if m.starts_with(&format!("{id} panicked: "))), "{id}: {r:?}");
+        assert_eq!(crate::session::take_caught_panics().len(), 1, "{id}");
+        assert_eq!(text(&s), before, "{id}: the document is put back");
+        assert_eq!((s.undo_depth(), s.dirty, &s.sel), (undo, dirty, &sel), "{id}: undo, dirty flag and selection are put back");
+    }
+    // A command that doesn't mutate isn't snapshotted: what it did stays, but the session goes on.
+    let r = s.run("test.boomPure", &json!({}));
+    assert!(matches!(&r, Err(crate::CmdError::Failed(m)) if m.contains(" panicked: ")), "{r:?}");
+    let _ = crate::session::take_caught_panics();
+    s.clamp_selection();
+    let _ = s.layout();
+    run(&mut s, "text.insert", json!({"text": "still works"}));
+    assert!(text(&s).contains("still works"));
+}
+
 #[test]
 fn hostile_params_never_panic() {
     let reg = cmd::registry();
+    let dir = std::env::temp_dir().join(format!("wordcraft-hostile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A junk file, an empty file, a directory and paths that don't exist.
+    let junk_bytes: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    let junk_file = dir.join("junk.docx");
+    std::fs::write(&junk_file, &junk_bytes).unwrap();
+    let empty_file = dir.join("empty.png");
+    std::fs::write(&empty_file, b"").unwrap();
+    let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
+    // Words, not one 1 MB word: line breaking an unbreakable megabyte is slow in layout (not a command).
+    let long = "lorem ipsum ".repeat(1 << 14);
     let junk = [
         json!(null),
         json!({}),
@@ -2698,21 +2777,138 @@ fn hostile_params_never_panic() {
         json!({"value": -1e308, "rows": 1e9}),
         json!({"width": 1e-9, "height": 1e30, "top": -1e9, "left": 1e9}),
         json!({"section": {"pageW": -1e308, "pageH": 0, "marginTop": 1e30, "header": -5, "columns": {"count": 1000000, "space": -1e300, "widths": [[0, 0]]}}}),
+        // Huge sizes and counts: a command clamps them or refuses, it never allocates for them.
+        json!({"count": 1e9, "copies": 1e9, "page": 1e9, "times": 1e9, "rows": 1e6, "cols": 1e6, "columns": 1e6, "level": 1e9, "n": 1e9, "index": 1e9, "size": 1e9}),
+        json!({"count": u64::MAX, "copies": u64::MAX, "page": u64::MAX, "times": u64::MAX, "rows": u64::MAX, "cols": u64::MAX, "index": u64::MAX, "block": u64::MAX, "off": u64::MAX}),
+        json!({"count": -1, "copies": -1, "page": -1, "times": -1, "rows": -1, "cols": -1, "index": -1}),
+        // Positions in stories, tables and cells that aren't there, and empty or overlong paths.
+        json!({"pos": {"story": {"Part": 99}, "path": [3, 99, 99, 99, 4], "off": 7}, "anchor": {"story": "Body", "path": [], "off": 0}, "focus": {"story": "Body", "path": [u32::MAX], "off": u64::MAX}, "row": 1e9, "col": -1, "cell": [99, 99], "id": 99999, "start": u64::MAX, "end": 0}),
+        json!({"pos": {"story": "Body", "path": [1, 0, 0, 0, 0, 0, 0], "off": 1}, "anchor": {"story": {"Part": 0}, "path": [0], "off": 3}, "focus": {"story": "Body", "path": [7, 1, 1, 0], "off": 2}, "from": {"block": 99}, "to": {"block": 0, "off": 99999}}),
+        // A long string in every text-ish slot.
+        json!({"text": long, "name": long, "with": long, "value": long, "label": long, "title": long}),
+        // Files that don't exist, a junk file, an empty file, a directory, and junk inline data.
+        json!({"path": path(&dir.join("missing").join("nope.docx"))}),
+        json!({"path": path(&junk_file)}),
+        json!({"path": path(&empty_file)}),
+        json!({"path": path(&dir)}),
+        json!({"path": path(&dir.join("named.docx")), "data": "%%% not base64 %%%"}),
+        json!({"path": path(&dir.join("named.docx")), "data": "UEsDBBQAAAAIAAAAIQB4eHh4eHh4eHh4eHg="}),
     ];
+    let (mut slow, mut panics) = (Vec::new(), Vec::new());
     for spec in reg.all() {
-        // These reach outside the session (files). Read Aloud (`review.readAloud`, `readAloud.*`)
-        // is fuzzed too: under `cfg(test)` its backend is the silent `Hold`, asserted below.
-        if spec.id.starts_with("file.") || spec.id == "insert.picture" || spec.id == "insert.textFromFile" {
-            continue;
-        }
+        // Read Aloud (`review.readAloud`, `readAloud.*`) is fuzzed too: under `cfg(test)` its
+        // backend is the silent `Hold`, asserted below. Files only go to the temp dir above.
         for j in &junk {
             let mut s = Session::new(crate::sample::sample_document());
             assert_ne!(s.read_aloud.backend, crate::speech::Backend::System, "tests must never start real speech");
-            let _ = s.run(spec.id, j);
+            let t = std::time::Instant::now();
+            let r = s.run(spec.id, j);
+            panics.extend(caught_panic(spec.id, j, &r));
             s.clamp_selection();
             let _ = s.layout();
+            let took = t.elapsed();
+            if took > std::time::Duration::from_secs(5) {
+                slow.push(format!("{} ({:.1}s)", spec.id, took.as_secs_f64()));
+            }
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(panics.is_empty(), "{} command panics on hostile params:\n{}", panics.len(), panics.join("\n"));
+    assert!(slow.is_empty(), "commands too slow on hostile params: {slow:?}");
+}
+
+/// Like `hostile_params_never_panic`, from the places a user leaves the caret: everything
+/// selected, a selection in a table cell, a caret between multi-byte characters, a caret in a
+/// header, an empty document.
+#[test]
+fn hostile_states_never_panic() {
+    let reg = cmd::registry();
+    let states: [(&str, fn(&mut Session)); 5] = [
+        ("select all", |s| {
+            let _ = s.run("select.all", &json!({}));
+        }),
+        ("table cell", |s| {
+            let _ = s.run("select.text", &json!({"text": "North windows"}));
+        }),
+        ("multi-byte", |s| {
+            let _ = s.run("text.insert", &json!({"text": "e\u{301}\u{1F600}\u{1F468}\u{200D}\u{1F469} \u{5D0}\u{5D1} ab"}));
+            let _ = s.run("caret.left", &json!({"count": 3}));
+            let _ = s.run("caret.left", &json!({"extend": true}));
+        }),
+        ("header", |s| {
+            let _ = s.run("insert.editHeader", &json!({}));
+            let _ = s.run("text.insert", &json!({"text": "Head \u{1F600}"}));
+        }),
+        ("empty document", |s| *s = Session::new(wordcraft_doc::Document::new())),
+    ];
+    let junk = [
+        json!({}),
+        json!({"block": 1, "off": 1, "row": 1, "col": 1, "index": 1, "start": 5, "end": 2, "from": 3, "to": 1, "level": 0, "page": 0, "count": 0, "text": "\u{1F600}"}),
+    ];
+    let mut panics = Vec::new();
+    for (name, state) in &states {
+        state(&mut Session::new(crate::sample::sample_document()));
+        assert_no_panic_caught();
+        for spec in reg.all() {
+            for j in &junk {
+                let mut s = Session::new(crate::sample::sample_document());
+                state(&mut s);
+                let r = s.run(spec.id, j);
+                panics.extend(caught_panic(spec.id, j, &r).map(|e| format!("[{name}] {e}")));
+                s.clamp_selection();
+                let _ = s.layout();
+            }
+        }
+    }
+    assert!(panics.is_empty(), "{} command panics:\n{}", panics.len(), panics.join("\n"));
+}
+
+/// Random command sequences on one session (fixed seeds): state built by one command must not
+/// panic the next, undo and redo included. `WC_FUZZ_STEPS` runs longer locally.
+#[test]
+fn hostile_command_sequences_never_panic() {
+    let reg = cmd::registry();
+    let specs: Vec<&crate::CommandSpec> =
+        reg.all().iter().filter(|c| !c.id.starts_with("file.") && c.id != "insert.picture" && c.id != "insert.textFromFile").collect();
+    let steps: usize = std::env::var("WC_FUZZ_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+    let seeds: u64 = std::env::var("WC_FUZZ_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let params = [
+        json!({}),
+        json!({"text": "ab \u{1F600}\u{301}"}),
+        json!({"count": 3, "extend": true}),
+        json!({"block": 1, "off": 1, "row": 1, "col": 1, "index": 1, "level": 2, "value": 1}),
+        json!({"rows": 2, "cols": 2, "text": "x"}),
+        json!({"value": true}),
+        json!({"size": 14, "name": "Heading 1"}),
+    ];
+    let mut panics = Vec::new();
+    for seed in 0..seeds {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut s = Session::new(crate::sample::sample_document());
+        let mut trail = Vec::new();
+        for _ in 0..steps {
+            let Some(spec) = specs.get((next() % specs.len() as u64) as usize) else { continue };
+            let Some(j) = params.get((next() % params.len() as u64) as usize) else { continue };
+            trail.push(format!("{} {j}", spec.id));
+            let r = s.run(spec.id, j);
+            if let Some(e) = caught_panic(spec.id, j, &r) {
+                let tail = trail.len().saturating_sub(8);
+                panics.push(format!("seed {seed}: {e}\n  after: {:?}", trail.get(tail..)));
+            }
+            if next() % 8 == 0 {
+                let _ = s.layout();
+            }
+        }
+        s.clamp_selection();
+        let _ = s.layout();
+    }
+    assert!(panics.is_empty(), "{} command panics:\n{}", panics.len(), panics.join("\n"));
 }
 
 #[test]
@@ -5151,6 +5347,7 @@ fn drag_after_multi_click_extends_by_units() {
     ] {
         let _ = s.run("select.dragUnit", &v);
     }
+    assert_no_panic_caught();
     assert_eq!(text(&s), before);
 }
 
@@ -5185,6 +5382,7 @@ fn selection_bar_selects_and_drags_by_lines() {
     // Junk positions never panic.
     let _ = s.run("select.line", &json!({"pos": {"block": 99, "off": usize::MAX}}));
     let _ = s.run("select.line", &json!({"pos": 5}));
+    assert_no_panic_caught();
 }
 
 /// Home › Font › Enclose Characters (#297): the selection becomes an `EQ \o\ac` field, saved the
@@ -5882,6 +6080,7 @@ fn smart_art_hostile_params_are_capped() {
     }
     assert_eq!(cmd::smart_art::selected_smart_art(&s).unwrap().items.len(), MAX_ITEMS);
     let _ = s.layout();
+    assert_no_panic_caught();
 }
 
 /// Outline view of: Heading 1 "One", body "a", Heading 2 "Two", body "b", Heading 1 "Three", body "c".
@@ -5936,7 +6135,8 @@ fn outline_level_changes_are_undoable() {
     for spec in cmd::registry().all().iter().filter(|c| c.id.starts_with("outline.")) {
         for j in [json!(null), json!({"block": 99999, "level": "x", "value": 5}), json!({"block": -1, "level": 0})] {
             let mut s = outline_doc();
-            let _ = s.run(spec.id, &j);
+            let r = s.run(spec.id, &j);
+            assert_no_caught_panic(spec.id, &j, &r);
             let _ = s.layout();
         }
     }
