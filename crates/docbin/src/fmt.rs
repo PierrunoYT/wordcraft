@@ -187,9 +187,15 @@ pub(crate) fn apply_char(p: &mut CharProps, prl: &Prl, base: &CharProps, fonts: 
     }
 }
 
+/// Most tab stops one paragraph or style keeps (Word's own limit, 64), `Clear` stops included.
+/// Sprms per grpprl are unbounded, so without it a style could pile up thousands of stops, each
+/// sprm then costing a scan of all of them.
+pub(crate) const MAX_TABS: usize = 64;
+
 /// Custom tab stops from `sprmPChgTabsPapx` / `sprmPChgTabs` ([MS-DOC] PChgTabsPapxOperand,
 /// PChgTabsOperand): the stops removed become `Clear` stops (they hide inherited ones) and the
-/// stops added carry their alignment and leader (TBD: jc in bits 0–2, tlc in bits 3–5).
+/// stops added carry their alignment and leader (TBD: jc in bits 0–2, tlc in bits 3–5). At most
+/// [`MAX_TABS`] stops are kept; later ones are dropped.
 fn change_tabs(p: &mut ParaProps, prl: &Prl) {
     let op = prl.operand;
     let i16_at = |i: usize| op.get(i..i + 2).map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 20.0);
@@ -210,9 +216,13 @@ fn change_tabs(p: &mut ParaProps, prl: &Prl) {
     let add = usize::from(add.min(64));
     at += 1;
     let mut tabs = p.tabs.take().unwrap_or_default();
+    tabs.truncate(MAX_TABS);
     // Removed within 25 twips (1.25 pt), as the format says.
     tabs.retain(|t| !removed.iter().any(|x| (t.pos - x).abs() <= 1.25));
     for x in removed {
+        if tabs.len() >= MAX_TABS {
+            break;
+        }
         tabs.push(TabStop { pos: x, align: TabAlign::Clear, leader: TabLeader::None });
     }
     for k in 0..add {
@@ -232,6 +242,9 @@ fn change_tabs(p: &mut ParaProps, prl: &Prl) {
             _ => TabLeader::None,
         };
         tabs.retain(|t| (t.pos - pos).abs() > 0.05);
+        if tabs.len() >= MAX_TABS {
+            break;
+        }
         tabs.push(TabStop { pos, align, leader });
     }
     tabs.sort_by(|a, b| a.pos.total_cmp(&b.pos));
@@ -337,6 +350,7 @@ pub(crate) fn stylesheet(raw: &[crate::stsh::RawStyle], fonts: &[String]) -> Sty
     if sheet.default_chr.size.is_none() {
         sheet.default_chr.size = Some(10.0);
     }
+    let resolved = resolve_styles(raw, fonts);
     for (istd, st) in raw.iter().enumerate() {
         if st.name.is_empty() {
             continue;
@@ -350,12 +364,7 @@ pub(crate) fn stylesheet(raw: &[crate::stsh::RawStyle], fonts: &[String]) -> Sty
         };
         let base = base_of(raw, istd).and_then(|i| raw.get(i)).map(|b| style_id(&b.name));
         // Inherit: properties come from the base chain, root first, then our own grpprls.
-        let mut chr = CharProps::default();
-        let mut para = ParaProps::default();
-        for s in style_chain(raw, istd).into_iter().filter_map(|i| raw.get(i)) {
-            apply_chain(&mut chr, &s.chpx, fonts);
-            apply_chain_para(&mut para, &s.papx);
-        }
+        let (chr, mut para) = resolved.get(istd).cloned().flatten().unwrap_or_default();
         if para.outline_level.is_none() && kind == StyleKind::Paragraph {
             let h = heading_level(&st.name);
             if h > 0 {
@@ -367,9 +376,6 @@ pub(crate) fn stylesheet(raw: &[crate::stsh::RawStyle], fonts: &[String]) -> Sty
     sheet
 }
 
-/// Most `istdBase` links followed; a longer chain (or a cycle) in a corrupt file stops there.
-const MAX_STYLE_DEPTH: usize = 16;
-
 /// The parent of style `istd`: its zero-based `istdBase` ([MS-DOC] §2.9.260), when that names
 /// another existing, named style (0x0FFF means none).
 fn base_of(raw: &[crate::stsh::RawStyle], istd: usize) -> Option<usize> {
@@ -378,21 +384,53 @@ fn base_of(raw: &[crate::stsh::RawStyle], istd: usize) -> Option<usize> {
     (b != 0x0FFF && b != istd && raw.get(b).is_some_and(|s| !s.name.is_empty())).then_some(b)
 }
 
-/// Style `istd` and its ancestors, root first and `istd` last. Cycles and chains deeper than
-/// [`MAX_STYLE_DEPTH`] are cut.
-fn style_chain(raw: &[crate::stsh::RawStyle], istd: usize) -> Vec<usize> {
-    let mut chain = vec![istd];
-    let mut cur = istd;
-    while chain.len() < MAX_STYLE_DEPTH {
-        let Some(b) = base_of(raw, cur) else { break };
-        if chain.contains(&b) {
-            break;
+/// Resolved (character, paragraph) properties by istd; `None` for unnamed styles.
+type Resolved = Vec<Option<(CharProps, ParaProps)>>;
+
+/// The properties of every named style: its base chain's, root first, then its own grpprls.
+/// Each style is resolved once, as its parent's resolved properties plus its own grpprls
+/// (memoised by istd), so a deep chain, or thousands of styles over one heavy base, costs one
+/// pass over each grpprl rather than one per descendant. A cycle in a corrupt file is cut where
+/// it closes: the style whose base is already on the path being resolved counts as a root.
+fn resolve_styles(raw: &[crate::stsh::RawStyle], fonts: &[String]) -> Resolved {
+    let mut done: Resolved = vec![None; raw.len()];
+    let mut on_path = vec![false; raw.len()];
+    let mut path: Vec<usize> = Vec::new();
+    for istd in 0..raw.len() {
+        // Climb to the nearest resolved ancestor (or a root, or where a cycle closes)…
+        path.clear();
+        let mut cur = istd;
+        let mut from = None;
+        while raw.get(cur).is_some_and(|s| !s.name.is_empty()) {
+            if let Some(Some(props)) = done.get(cur) {
+                from = Some(props.clone());
+                break;
+            }
+            path.push(cur);
+            if let Some(seen) = on_path.get_mut(cur) {
+                *seen = true;
+            }
+            match base_of(raw, cur) {
+                Some(b) if !on_path.get(b).copied().unwrap_or(true) => cur = b,
+                _ => break,
+            }
         }
-        chain.push(b);
-        cur = b;
+        // …then resolve back down, each style over its parent.
+        let (mut chr, mut para) = from.unwrap_or_default();
+        for &i in path.iter().rev() {
+            if let Some(s) = raw.get(i) {
+                apply_chain(&mut chr, &s.chpx, fonts);
+                apply_chain_para(&mut para, &s.papx);
+            }
+            if let Some(slot) = done.get_mut(i) {
+                *slot = Some((chr.clone(), para.clone()));
+            }
+            if let Some(seen) = on_path.get_mut(i) {
+                *seen = false;
+            }
+        }
     }
-    chain.reverse();
-    chain
+    done
 }
 
 /// The style-id form of a stored (lower-case) built-in name, matching the docx reader's ids.
