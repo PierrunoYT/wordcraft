@@ -2031,7 +2031,7 @@ impl WordApp {
         keys::global_shortcuts(self, &ctx);
         self.refocus_after_chrome_click(&ctx);
         if let Some(url) = self.canvas.open_url.take() {
-            ctx.open_url(egui::OpenUrl::new_tab(url));
+            open_in_new_tab(&ctx, url);
         }
         let title = if self.has_document() {
             format!("{}{} - WordCraft", self.title_stem(), if self.session.dirty { " •" } else { "" })
@@ -2426,6 +2426,25 @@ pub fn now_ms() -> f64 {
     }
 }
 
+/// Opens a link (already checked: see `canvas::followed_url`) in a new browser tab or the mail
+/// client. Native: through egui, which hands it to the system browser.
+#[cfg(not(target_arch = "wasm32"))]
+fn open_in_new_tab(ctx: &egui::Context, url: String) {
+    ctx.open_url(egui::OpenUrl::new_tab(url));
+}
+
+/// Web: eframe's `open_url` calls `window.open(url, "_blank")` without `noopener`, so the opened
+/// page would get `window.opener` and could navigate this tab elsewhere (reverse tabnabbing,
+/// WC-30). Open it ourselves with `noopener,noreferrer`.
+#[cfg(target_arch = "wasm32")]
+fn open_in_new_tab(_ctx: &egui::Context, url: String) {
+    if let Some(window) = web_sys::window()
+        && window.open_with_url_and_target_and_features(&url, "_blank", "noopener,noreferrer").is_err()
+    {
+        log::warn!("could not open {url}");
+    }
+}
+
 /// macOS reads a Control-click as the right-click (winit reports the primary button with Control
 /// held), so menus open on it as on a two-finger click. The release follows its press even if
 /// Control was let go in between.
@@ -2455,6 +2474,25 @@ mod tests {
 
     fn mod_key(key: egui::Key) -> egui::Event {
         egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND }
+    }
+
+    /// WC-30 (#2771) changed only the web build (which opens links itself with
+    /// `noopener,noreferrer`): natively a followed link still reaches egui as a new-tab URL.
+    #[test]
+    fn a_followed_link_opens_in_a_new_tab() {
+        let ctx = egui::Context::default();
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| open_in_new_tab(ui.ctx(), "https://example.com/x".into()));
+        let opened: Vec<egui::OpenUrl> = out
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::OpenUrl(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
+        out.drop_without_applying_deltas();
+        assert_eq!(opened, vec![egui::OpenUrl::new_tab("https://example.com/x")]);
     }
 
     /// Issue #14: Mod+- (optional hyphen) also zoomed the whole window out, so it read as "zoom out".
