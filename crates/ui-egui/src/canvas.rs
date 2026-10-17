@@ -2285,8 +2285,8 @@ fn mouse(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect], layo
                 if app.run("edit.goto", json!({"bookmark": name})).is_ok() {
                     let _ = app.run("select.collapse", json!({}));
                 }
-            } else if is_followable_link(&link) {
-                app.canvas.open_url = Some(link);
+            } else if let Some(url) = followed_url(&link) {
+                app.canvas.open_url = Some(url);
             } else {
                 app.status(tl!("Only web (http, https) and email (mailto) links can be followed"));
             }
@@ -3052,10 +3052,31 @@ fn link_under(app: &WordApp, layout: &DocLayout, page: usize, x: f32, y: f32, po
     })
 }
 
-/// Whether Ctrl/⌘+click may hand a document's hyperlink to the system: web and email links only,
-/// so a document can't launch `file:` paths, programs or custom-scheme handlers.
-fn is_followable_link(url: &str) -> bool {
-    wordcraft_doc::link::is_web_or_mail_link(url)
+/// What Ctrl/⌘+click hands to the system for a document's hyperlink, or `None` when it isn't
+/// followed: web and email links only, so a document can't launch `file:` paths, programs or
+/// custom-scheme handlers (`wordcraft_doc::link::followable_link`, which also normalises it).
+fn followed_url(url: &str) -> Option<String> {
+    checked_by_opener(wordcraft_doc::link::followable_link(url)?)
+}
+
+/// Natively, the link is parsed once more with the parser `webbrowser` uses, and its output is
+/// what gets opened: `webbrowser` retries a string it can't parse as a local file path, so
+/// nothing it can't parse may reach it (WC-28).
+#[cfg(not(target_arch = "wasm32"))]
+fn checked_by_opener(link: String) -> Option<String> {
+    let parsed = url::Url::parse(&link).ok()?;
+    let ok = match parsed.scheme() {
+        "http" | "https" => parsed.host_str().is_some_and(|h| !h.is_empty()) && parsed.username().is_empty() && parsed.password().is_none(),
+        "mailto" => true,
+        _ => false,
+    };
+    ok.then(|| parsed.as_str().to_string())
+}
+
+/// On the web the browser parses the link itself; one it can't parse just doesn't open.
+#[cfg(target_arch = "wasm32")]
+fn checked_by_opener(link: String) -> Option<String> {
+    Some(link)
 }
 
 #[cfg(test)]
@@ -3976,7 +3997,7 @@ mod tests {
     #[test]
     fn only_web_and_email_links_are_followed() {
         for ok in ["https://example.com/a?b#c", "http://example.com", "HTTPS://EXAMPLE.COM", "mailto:someone@example.com"] {
-            assert!(is_followable_link(ok), "{ok}");
+            assert!(followed_url(ok).is_some(), "{ok}");
         }
         for bad in [
             "file:///etc/passwd",
@@ -3992,7 +4013,39 @@ mod tests {
             "",
             "example.com",
         ] {
-            assert!(!is_followable_link(bad), "{bad:?}");
+            assert!(followed_url(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    /// WC-28 (#2769): what reaches the opener is the `url` parser's own output (an IDN host in
+    /// punycode), so `webbrowser` can't fall back to reading it as a local file path; a link
+    /// that parser rejects isn't followed at all.
+    #[test]
+    fn followed_links_are_what_the_opener_parses() {
+        for (link, want) in [
+            ("https://example.com/a b?q=1#c", "https://example.com/a%20b?q=1#c"),
+            ("HTTP://Example.COM", "http://example.com/"),
+            ("http://example.com:8080/x", "http://example.com:8080/x"),
+            ("https://b\u{fc}cher.example/", "https://xn--bcher-kva.example/"),
+            ("http://[::1]:8080/", "http://[::1]:8080/"),
+            ("mailto:a@example.com?subject=Hi&attach=/etc/passwd", "mailto:a@example.com?subject=Hi"),
+        ] {
+            assert_eq!(followed_url(link).as_deref(), Some(want), "{link}");
+        }
+        for bad in [
+            "http://x:99999/../../../../home/u/Downloads/evil.html",
+            "http://good.example@evil.example/",
+            "http://evil.example\\@good.example/",
+            "http://1.2.3.256/",
+            // Not valid punycode: the parser rejects it, so the link isn't followed.
+            "http://xn--a.example/",
+        ] {
+            assert_eq!(followed_url(bad), None, "{bad:?}");
+        }
+        // Whatever passes the hand-rolled check also parses, as web (with a host) or mail.
+        for link in ["http://a", "http://a.b.c.d.e", "https://x_y.example/%zz", "http://[1:2:3:4:5:6:7:8]/", "mailto:x?body=%"] {
+            let url = followed_url(link).unwrap_or_else(|| panic!("{link}"));
+            assert!(url::Url::parse(&url).is_ok(), "{link} -> {url}");
         }
     }
 

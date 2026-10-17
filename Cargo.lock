@@ -5391,6 +5391,7 @@ dependencies = [
  "sys-locale",
  "toml",
  "unicode-bidi",
+ "url",
  "wordcraft-doc",
  "wordcraft-engine",
  "wordcraft-fonts",

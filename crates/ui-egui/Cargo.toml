@@ -38,6 +38,11 @@ zbus = "=5.19.0"
 # The browser clock (`SystemTime::now()`/`Instant::now()` panic on wasm32).
 js-sys = "0.3"
 
+# Native: a followed hyperlink is checked with the URL parser `webbrowser` uses (WC-28). Already
+# in the tree through eframe's `webbrowser`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+url = "2.5"
+
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
 zip = { workspace = true }
