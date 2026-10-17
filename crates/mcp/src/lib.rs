@@ -46,7 +46,9 @@ impl Headless {
             "document.inspect" => self.session.run("document.inspect", &params).map_err(|e| e.to_string()),
             "ui.parity" => Ok(wordcraft_engine::catalog::parity(&self.session.registry)),
             "ui.render" | "render.page" => {
-                let page = params.get("page").and_then(Value::as_u64).unwrap_or(1).max(1) as usize - 1;
+                // 1-based; a page number past `usize` (32-bit targets) is simply no page.
+                let page = params.get("page").and_then(Value::as_u64).unwrap_or(1).max(1);
+                let page = usize::try_from(page).unwrap_or(usize::MAX).saturating_sub(1);
                 let scale = params.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.1, 4.0) as f32;
                 let l = self.session.layout();
                 let pg = l.pages.get(page).ok_or_else(|| format!("no page {}", page + 1))?;

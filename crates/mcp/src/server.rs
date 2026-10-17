@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 framing and the MCP lifecycle / tools / resources methods.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 
 use serde_json::{Value, json};
 
@@ -27,6 +27,48 @@ execute format.bold → inspect_document to verify → render_page to look at th
 /// Resource URIs.
 pub const DOC_URI: &str = "wordcraft://document";
 pub const COMMANDS_URI: &str = "wordcraft://commands";
+
+/// The longest JSON-RPC message (one line) the server reads; longer ones are refused.
+pub const MAX_MESSAGE: usize = 64 << 20;
+
+/// The next line of `input` without its line ending, reading at most `max` bytes of it into
+/// memory. `None` at the end of the input; `Some(Err)` for a line over `max` bytes (the rest of it
+/// is read and dropped) or one that isn't UTF-8.
+fn next_line(input: &mut impl BufRead, max: usize) -> std::io::Result<Option<Result<String, String>>> {
+    let mut buf = Vec::new();
+    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    if Read::take(&mut *input, limit).read_until(b'\n', &mut buf)? == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+    if buf.len() > max {
+        skip_line(input)?;
+        return Ok(Some(Err(format!("message over {max} bytes"))));
+    }
+    Ok(Some(String::from_utf8(buf).map_err(|_| "message is not UTF-8".to_string())))
+}
+
+/// Read and drop input up to and including the next line break (or the end of the input).
+fn skip_line(input: &mut impl BufRead) -> std::io::Result<()> {
+    loop {
+        let (used, done) = match input.fill_buf()? {
+            [] => return Ok(()),
+            b => match b.iter().position(|&c| c == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (b.len(), false),
+            },
+        };
+        input.consume(used);
+        if done {
+            return Ok(());
+        }
+    }
+}
 
 /// An MCP server bound to one backend.
 pub struct Server {
@@ -57,17 +99,25 @@ impl Server {
     }
 
     /// Serve newline-delimited JSON-RPC until `input` closes. Logs go to stderr only (stdout is
-    /// the protocol stream).
-    pub fn serve(&mut self, input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
-        for line in input.lines() {
-            let line = line?;
-            if let Some(reply) = self.handle_line(&line) {
+    /// the protocol stream). A message over [`MAX_MESSAGE`] bytes is skipped without being held
+    /// in memory and gets an error reply.
+    pub fn serve(&mut self, input: impl BufRead, output: impl Write) -> std::io::Result<()> {
+        self.serve_with_limit(input, output, MAX_MESSAGE)
+    }
+
+    pub(crate) fn serve_with_limit(&mut self, mut input: impl BufRead, mut output: impl Write, max: usize) -> std::io::Result<()> {
+        loop {
+            let reply = match next_line(&mut input, max)? {
+                None => return Ok(()),
+                Some(Ok(line)) => self.handle_line(&line),
+                Some(Err(e)) => Some(error(Value::Null, PARSE_ERROR, e).to_string()),
+            };
+            if let Some(reply) = reply {
                 output.write_all(reply.as_bytes())?;
                 output.write_all(b"\n")?;
                 output.flush()?;
             }
         }
-        Ok(())
     }
 
     /// Handle one line; returns the reply line (None for notifications and blank lines).

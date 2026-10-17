@@ -1,6 +1,6 @@
 //! Where MCP tool calls end up: a control-channel method call.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
@@ -94,6 +94,25 @@ fn targets(addr: &str) -> std::io::Result<Vec<SocketAddr>> {
     Ok(addr.to_socket_addrs()?.collect())
 }
 
+/// The longest reply line read from the app. Replies carry base64 PNGs (window screenshots,
+/// pages rendered at up to 8x), so this is generous; it bounds what a peer can make the bridge
+/// hold in memory.
+const MAX_REPLY: usize = 256 << 20;
+
+/// One reply line, reading at most `max` bytes. A longer reply is `InvalidData` (the caller drops
+/// the connection and does not retry, since the request may have run).
+fn read_reply(reader: &mut impl BufRead, max: usize) -> std::io::Result<String> {
+    let mut buf = Vec::new();
+    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    if Read::take(&mut *reader, limit).read_until(b'\n', &mut buf)? == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "control channel closed"));
+    }
+    if buf.len() > max && buf.last() != Some(&b'\n') {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("reply over {max} bytes")));
+    }
+    String::from_utf8(buf).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "reply is not UTF-8"))
+}
+
 impl Remote {
     /// Connect to `addr` (`127.0.0.1:7981`), failing fast when nothing is listening.
     pub fn connect(addr: &str) -> std::io::Result<Self> {
@@ -166,11 +185,7 @@ impl Remote {
         writer.write_all(line.as_bytes())?;
         writer.write_all(b"\n")?;
         writer.flush()?;
-        let mut reply = String::new();
-        if reader.read_line(&mut reply)? == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "control channel closed"));
-        }
-        Ok(reply)
+        read_reply(reader, MAX_REPLY)
     }
 
     /// One request and its reply, with one retry on a new connection (the app may have
@@ -189,6 +204,12 @@ impl Remote {
             };
             match result {
                 Ok(r) => break r,
+                // An oversize or garbled reply: the app (or whatever answers) did get the
+                // request, so it is not sent again.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    self.conn = None;
+                    return Err(format!("bad reply from {}: {e}", self.addr));
+                }
                 Err(e) => {
                     self.conn = None;
                     if !first {
@@ -319,6 +340,48 @@ mod tests {
         assert!(targets("localhost:70000").is_err());
         // Literal addresses stay as given (the key decision is separate).
         assert_eq!(targets("[::1]:7981").unwrap(), vec!["[::1]:7981".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn replies_are_bounded() {
+        let mut r = BufReader::new(&b"{\"ok\":true}\nnext\n"[..]);
+        assert_eq!(read_reply(&mut r, 16).unwrap(), "{\"ok\":true}\n");
+        // Exactly the limit, plus the line break.
+        let mut r = BufReader::new(&b"0123456789abcdef\n"[..]);
+        assert_eq!(read_reply(&mut r, 16).unwrap(), "0123456789abcdef\n");
+        // A peer that never ends its line: at most `max + 1` bytes are held.
+        let endless = "z".repeat(10_000);
+        let mut r = BufReader::new(endless.as_bytes());
+        assert_eq!(read_reply(&mut r, 16).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(read_reply(&mut BufReader::new(&b""[..]), 16).unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(read_reply(&mut BufReader::new(&b"\xff\n"[..]), 16).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_garbled_reply_is_not_retried() {
+        // The request reached the peer, so it must not run twice.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, seen) = channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut out = stream.try_clone().unwrap();
+                    for line in BufReader::new(stream).lines() {
+                        let _ = tx.send(line.unwrap_or_default());
+                        if out.write_all(b"\xff\xfe\n").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let mut r = Remote::connect_with(&format!("127.0.0.1:{port}"), fixed_key("k")).unwrap();
+        let e = r.call("format.bold", json!({})).unwrap_err();
+        assert!(e.contains("bad reply"), "{e}");
+        assert!(seen.recv_timeout(WAIT).is_ok());
+        assert!(seen.recv_timeout(Duration::from_millis(300)).is_err(), "sent once");
     }
 
     #[test]

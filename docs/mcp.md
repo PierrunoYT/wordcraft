@@ -16,6 +16,10 @@ With `--connect`, the bridge sends the app's control key, which it reads from
 `127.0.0.1` (`--connect 127.0.0.1:PORT` or `localhost:PORT`), where the app listens; see
 [Keys](control-protocol.md#keys).
 
+Messages are one JSON-RPC object per line. A line over 64 MiB is skipped and answered with a
+parse error; the server keeps reading. With `--connect`, a reply from the app over 256 MiB (or one
+that isn't UTF-8) fails that call and drops the connection, and the request is not sent again.
+
 ## Tracked changes by an agent
 
 Tracked changes and comments are recorded under the session's user name ("WordCraft User" by

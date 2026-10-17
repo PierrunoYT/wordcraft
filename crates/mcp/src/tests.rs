@@ -152,3 +152,41 @@ fn type_text_stops_at_a_refused_paragraph_break() {
     assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("paragraph break refused"), "{r}");
     assert_eq!(*calls.lock().unwrap(), vec!["text.insert", "text.newParagraph"]);
 }
+
+/// A message over the size limit is refused without stopping the server, and the next message
+/// is answered; so are CRLF line endings. A non-UTF-8 line gets an error too.
+#[test]
+fn stdio_messages_are_bounded() {
+    let mut s = Server::new(Box::new(Headless::default()));
+    let ping = |id: u64| json!({"jsonrpc": "2.0", "id": id, "method": "ping"}).to_string();
+    let mut input = Vec::new();
+    input.extend_from_slice(format!("{}\n", ping(1)).as_bytes());
+    input.extend_from_slice(format!("{{\"pad\":\"{}\"}}\n", "x".repeat(500)).as_bytes());
+    input.extend_from_slice(format!("{}\r\n", ping(2)).as_bytes());
+    input.extend_from_slice(b"\xff\xfe\n");
+    // The last line is too long and never ends.
+    input.extend_from_slice(format!("{}\n{}", ping(3), "y".repeat(1000)).as_bytes());
+    let mut out = Vec::new();
+    s.serve_with_limit(&input[..], &mut out, 200).unwrap();
+    let replies: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(replies.len(), 6, "{replies:?}");
+    assert_eq!(replies[0]["id"], 1);
+    assert!(replies[1]["error"]["message"].as_str().unwrap().contains("over 200 bytes"), "{}", replies[1]);
+    assert_eq!(replies[2]["id"], 2);
+    assert!(replies[3]["error"]["message"].as_str().unwrap().contains("UTF-8"), "{}", replies[3]);
+    assert_eq!(replies[4]["id"], 3);
+    assert!(replies[5]["error"]["message"].as_str().unwrap().contains("over 200 bytes"), "{}", replies[5]);
+}
+
+/// The headless `ui.render` page number is 1-based, and a huge one is no page (never a wrapped
+/// index, also on 32-bit targets).
+#[test]
+fn headless_render_page_numbers_are_checked() {
+    use crate::Backend;
+    let mut h = Headless::default();
+    assert!(h.call("ui.render", json!({"page": 0, "scale": 0.2})).is_ok(), "page 0 means page 1");
+    for page in [2, u64::from(u32::MAX) + 1, u64::MAX] {
+        let e = h.call("ui.render", json!({"page": page, "scale": 0.2})).unwrap_err();
+        assert!(e.starts_with("no page"), "{page}: {e}");
+    }
+}
