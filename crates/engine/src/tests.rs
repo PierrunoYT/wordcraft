@@ -5657,7 +5657,13 @@ const PORTUGUESE_TEST_DIC: &str = "11\nsaudade\ncoração\ne\nele\ndisse\nnão\n
 fn dictionaries_folder_option_is_saved_searched_and_reported() {
     let dir = std::env::temp_dir().join(format!("wc-engine-dictionaries-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    for (name, aff, dic) in [("pl_PL", POLISH_TEST_AFF, POLISH_TEST_DIC), ("pt_BR", PORTUGUESE_TEST_AFF, PORTUGUESE_TEST_DIC)] {
+    // Setting the folder drops every loaded Hunspell dictionary (Italian too), so each language a
+    // test installs must be in it, or a test running meanwhile loses its words.
+    for (name, aff, dic) in [
+        ("pl_PL", POLISH_TEST_AFF, POLISH_TEST_DIC),
+        ("pt_BR", PORTUGUESE_TEST_AFF, PORTUGUESE_TEST_DIC),
+        ("it_IT", ITALIAN_TEST_AFF, ITALIAN_TEST_DIC),
+    ] {
         std::fs::write(dir.join(format!("{name}.aff")), aff).unwrap();
         std::fs::write(dir.join(format!("{name}.dic")), dic).unwrap();
     }
@@ -5761,10 +5767,11 @@ fn czech_proofing_through_the_review_commands() {
 /// Review › Language and the proofing commands work in Polish end to end: the language makes
 /// the document's words Polish, F7 and the issue list use the Polish dictionary and grammar,
 /// suggestions come from it, and a suggestion fixes the text.
+const ITALIAN_TEST_AFF: &str = "SET UTF-8\nTRY aeiortnsclcaffèéè\nMAP 2\nMAP aà\nMAP eéè\nREP 1\nREP caffe caffè\n";
+const ITALIAN_TEST_DIC: &str = "6\ncasa\ncaffè\nroma\ndisse\ne\nper\n";
+
 fn italian_test_dictionary() {
-    let aff = "SET UTF-8\nTRY aeiortnsclcaffèéè\nMAP 2\nMAP aà\nMAP eéè\nREP 1\nREP caffe caffè\n";
-    let dic = "6\ncasa\ncaffè\nroma\ndisse\ne\nper\n";
-    wordcraft_proof::it::install_dictionary(aff, dic).unwrap();
+    wordcraft_proof::it::install_dictionary(ITALIAN_TEST_AFF, ITALIAN_TEST_DIC).unwrap();
 }
 
 /// Review › Language and the proofing commands work in Italian end to end: the language makes
