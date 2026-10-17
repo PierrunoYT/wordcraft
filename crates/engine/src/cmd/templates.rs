@@ -240,9 +240,10 @@ pub fn local_path(target: &str, base: Option<&Path>) -> Option<PathBuf> {
     Some(p)
 }
 
+/// `\\host\share`, `//host/share`, `\\?\UNC\…`, and device and NT paths (`\\.\…`, `\??\UNC\…`),
+/// told by their spelling (#2746).
 fn is_network_path(p: &str) -> bool {
-    let b = p.as_bytes();
-    matches!((b.first(), b.get(1)), (Some(b'\\' | b'/'), Some(b'\\' | b'/')))
+    crate::file_access::is_network_or_device_path(p)
 }
 
 fn is_windows_absolute(p: &str) -> bool {
@@ -504,6 +505,11 @@ mod tests {
             "file://evil.example/share/T.dotx",
             "file:////evil.example/share/T.dotx",
             "FILE://Evil.Example/T.dotx",
+            // The NT object namespace and device paths reach other machines too (#2746).
+            "\\??\\UNC\\evil.example\\share\\T.dotx",
+            "file:///??/UNC/evil.example/share/T.dotx",
+            "\\\\.\\pipe\\x",
+            "\\\\.\\UNC\\evil.example\\share\\T.dotx",
         ] {
             assert_eq!(local_path(remote, Some(Path::new("/docs/Letter.docx"))), None, "{remote}");
         }

@@ -246,7 +246,8 @@ fn dictionaries_folder(f: &str) -> Result<Option<String>, CmdError> {
     if !path.is_absolute() {
         return Err(CmdError::Params(format!("`dictionariesFolder`: {f:?} isn't a full path")));
     }
-    if !path.is_dir() {
+    // Through `io`, so automation keeps to its read root and never probes a network share (#2775).
+    if !crate::io::is_folder(&path.to_string_lossy()).map_err(CmdError::Failed)? {
         return Err(CmdError::Failed(format!("no folder at {}", path.display())));
     }
     Ok(Some(path.to_string_lossy().into_owned()))

@@ -214,12 +214,26 @@ pub(crate) fn picture(s: &mut Session, v: &Value) -> CmdResult {
     let bytes = if let Some(d) = p::str(v, "data") {
         base64_decode(d).ok_or_else(|| CmdError::Params("bad base64 data".into()))?
     } else if let Some(path) = p::str(v, "path") {
-        crate::io::read_file(path).map_err(CmdError::Failed)?
+        // Refused by its length before it is read, not after (audit WC-22).
+        read_picture_file(path)?
     } else {
         s.ui_requests.push(json!({"open": "insertPicture"}));
         return sel_result(s);
     };
     place_picture(s, bytes, p::f32(v, "width"), p::str(v, "alt").unwrap_or(""))
+}
+
+/// Largest picture inserted.
+const MAX_PICTURE_FILE: u64 = 200 << 20;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_picture_file(path: &str) -> Result<Vec<u8>, CmdError> {
+    crate::io::read_file_capped(path, MAX_PICTURE_FILE, "image").map_err(CmdError::Failed)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_picture_file(path: &str) -> Result<Vec<u8>, CmdError> {
+    crate::io::read_file(path).map_err(CmdError::Failed)
 }
 
 /// The media extension of an encoded image by its magic bytes, as `image_size` accepted it
@@ -241,7 +255,7 @@ pub(crate) fn image_ext(bytes: &[u8]) -> &'static str {
 /// script's next typing doesn't replace it (#965); Picture Format commands still act on it. The
 /// app selects a picture the person inserts (`WordApp::run`).
 fn place_picture(s: &mut Session, bytes: Vec<u8>, width: Option<f32>, alt: &str) -> CmdResult {
-    if bytes.len() > 200 << 20 {
+    if bytes.len() as u64 > MAX_PICTURE_FILE {
         return Err(CmdError::Failed("image is larger than 200 MB".into()));
     }
     // Natural size: pixels at 96 ppi, or a metafile's own frame (WMF, EMF: #802).

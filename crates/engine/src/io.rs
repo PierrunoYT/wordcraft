@@ -102,7 +102,7 @@ pub fn wrong_password(err: &str) -> bool {
 /// can't be read: opening it says why.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn is_empty_file(path: &std::path::Path) -> bool {
-    crate::file_access::check_read(&path.to_string_lossy()).is_ok() && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == 0)
+    crate::file_access::checked_read(&path.to_string_lossy()).is_ok_and(|path| std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == 0))
 }
 
 /// [`is_empty_file`]: on the web files come through the browser, never by path.
@@ -346,16 +346,14 @@ pub fn open_path_with(path: &std::path::Path, password: Option<&str>) -> Result<
 /// [`open_path_with`] in `region` (see [`open_bytes_in`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_path_in(path: &std::path::Path, password: Option<&str>, region: &wordcraft_geom::Region) -> Result<(Document, bool), String> {
-    crate::file_access::check_read(&path.to_string_lossy())?;
-    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if meta.len() > 2 << 30 {
-        return Err(format!("{}: file is larger than 2 GB", path.display()));
-    }
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Read the path that was checked (links followed), so the file is the one checked (#2774).
+    let checked = crate::file_access::checked_read(&path.to_string_lossy())?;
+    let bytes = read_capped(&checked, MAX_OPEN, &path.display().to_string(), "file")?;
+    // The format comes from the name given (a link's own name, not its target's).
     let name = path.to_string_lossy();
     if matches!(ext_of(&name).as_str(), "html" | "htm" | "xhtml") {
         // Pictures referenced by a relative path load from beside the HTML file.
-        let images = LocalImages::new(path.parent().unwrap_or(std::path::Path::new("")));
+        let images = LocalImages::new(checked.parent().unwrap_or(std::path::Path::new("")));
         let html = wordcraft_formats::html::decode(&bytes);
         let mut doc = wordcraft_formats::html::import_on(&html, &|src| images.load(src), &region_page(region));
         fit_pictures(&mut doc);
@@ -455,26 +453,78 @@ impl LocalImages {
 /// and the read is bounded whatever length the file reports.
 #[cfg(not(target_arch = "wasm32"))]
 fn read_regular_file(path: &std::path::Path, limit: u64) -> Option<Vec<u8>> {
+    read_regular(path, limit).ok()
+}
+
+/// [`read_regular_file`], saying why not.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_regular(path: &std::path::Path, limit: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
-    if !std::fs::metadata(path).ok()?.is_file() {
-        return None;
+    let not_a_file = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file");
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_a_file());
     }
-    let file = std::fs::File::open(path).ok()?;
-    let meta = file.metadata().ok()?;
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
     if !meta.is_file() {
-        return None;
+        return Err(not_a_file());
     }
     let mut out = Vec::with_capacity(usize::try_from(meta.len().min(limit)).unwrap_or(0));
-    file.take(limit.saturating_add(1)).read_to_end(&mut out).ok()?;
-    Some(out)
+    file.take(limit.saturating_add(1)).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Largest document file opened.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_OPEN: u64 = 2 << 30;
+
+/// Largest file a command reads by path ([`read_file`]: pictures, mail-merge data).
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_READ: u64 = 1 << 30;
+
+/// The regular file at `path` (checked already), at most `max` bytes. A named pipe or a device is
+/// refused before it is opened, a file whose length is over `max` before it is read, and one that
+/// grows past `max` while it is read once `max` bytes are in: nothing is read without end (audit
+/// WC-22). `shown` names it in errors; `what` says what it is (`the {what} is larger than …`).
+#[cfg(not(target_arch = "wasm32"))]
+fn read_capped(path: &std::path::Path, max: u64, shown: &str, what: &str) -> Result<Vec<u8>, String> {
+    let too_large = || match max {
+        m if m >= 1 << 30 => format!("{shown}: the {what} is larger than {} GB", m >> 30),
+        m => format!("{shown}: the {what} is larger than {} MB", m >> 20),
+    };
+    let meta = std::fs::metadata(path).map_err(|e| format!("{shown}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{shown}: not a file"));
+    }
+    if meta.len() > max {
+        return Err(too_large());
+    }
+    let bytes = read_regular(path, max).map_err(|e| format!("{shown}: {e}"))?;
+    if bytes.len() as u64 > max {
+        return Err(too_large());
+    }
+    Ok(bytes)
 }
 
 /// The bytes of the file at `path`, for commands that take a path (pictures, mail-merge data).
 /// Every such read goes through here so the automation read root applies ([`crate::file_access`]).
+/// Only a regular file of at most [`MAX_READ`] bytes is read.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
-    crate::file_access::check_read(path)?;
-    std::fs::read(path).map_err(|e| format!("{path}: {e}"))
+    read_file_capped(path, MAX_READ, "file")
+}
+
+/// Is there a folder at `path`? Asked within the automation read root when there is one, like a
+/// read (`false` when it isn't, or the path is refused).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn is_folder(path: &str) -> Result<bool, String> {
+    let path = crate::file_access::checked_read(path)?;
+    Ok(path.is_dir())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn is_folder(path: &str) -> Result<bool, String> {
+    Err(format!("{path}: folders are not reachable on the web"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -486,26 +536,18 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
 /// anything is read (a font named by the user, which could be any size).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_file_capped(path: &str, max: u64, what: &str) -> Result<Vec<u8>, String> {
-    crate::file_access::check_read(path)?;
-    let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
-    if !meta.is_file() {
-        return Err(format!("{path}: not a file"));
-    }
-    if meta.len() > max {
-        return Err(format!("{path}: the {what} is larger than {} MB", max >> 20));
-    }
-    std::fs::read(path).map_err(|e| format!("{path}: {e}"))
+    let checked = crate::file_access::checked_read(path)?;
+    read_capped(&checked, max, path, what)
 }
 
 /// The first `max` bytes of the file at `path` (fewer when it is shorter), inside the automation
-/// read root when there is one: enough to tell a file's format by its start.
+/// read root when there is one: enough to tell a file's format by its start. Only a regular file
+/// is opened (a named pipe would block).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_file_head(path: &str, max: u64) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    crate::file_access::check_read(path)?;
-    let f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
-    let mut head = Vec::new();
-    f.take(max).read_to_end(&mut head).map_err(|e| format!("{path}: {e}"))?;
+    let checked = crate::file_access::checked_read(path)?;
+    let mut head = read_regular(&checked, max).map_err(|e| format!("{path}: {e}"))?;
+    head.truncate(usize::try_from(max).unwrap_or(usize::MAX));
     Ok(head)
 }
 
@@ -546,9 +588,10 @@ fn only_case_differs(source: &std::path::Path, destination: &std::path::Path) ->
 /// Write `bytes` to the file at `path`, inside the automation write root when there is one.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_file(path: &str, bytes: &[u8]) -> Result<(), String> {
-    crate::file_access::check_write(path)?;
+    // Written where it was checked (links followed), its temporary file beside it (#2774).
+    let checked = crate::file_access::checked_write(path)?;
     // Like a document save: the old file is replaced only once the new bytes are fully written.
-    safe_save::write(std::path::Path::new(path), bytes).map_err(|e| format!("{path}: {e}"))
+    safe_save::write(&checked, bytes).map_err(|e| format!("{path}: {e}"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -573,9 +616,11 @@ pub fn save_path(path: &std::path::Path, doc: &Document) -> Result<(), String> {
 /// [`save_path`], encrypted with `password` as [`save_bytes_with`] does.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_path_with(path: &std::path::Path, doc: &Document, password: Option<&str>, opts: &ExportOptions) -> Result<(), String> {
-    crate::file_access::check_write(&path.to_string_lossy())?;
+    // Saved where it was checked (links followed), its temporary file beside it (#2774); the
+    // format comes from the name given.
+    let checked = crate::file_access::checked_write(&path.to_string_lossy())?;
     let bytes = save_bytes_with(&path.to_string_lossy(), doc, password, opts)?;
-    safe_save::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
+    safe_save::write(&checked, &bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -1,7 +1,7 @@
 //! The folders automation may read and write (#769).
 //!
-//! `wordcraft-cli mcp --automation-read-root <dir> --automation-write-root <dir>` confines the
-//! files an agent's commands reach. [`AutomationRoots`] holds the two folders. While they are in force, every path a command
+//! `wordcraft-cli mcp --automation-read-root <dir> --automation-write-root <dir>` (and
+//! `wordcraft --control <port>` with the same flags) confines the files an agent's commands reach. [`AutomationRoots`] holds the two folders. While they are in force, every path a command
 //! reads goes through [`check_read`] and every path it writes through [`check_write`]:
 //!
 //! - The path is made absolute against the working directory, as the file system reads it. Its
@@ -13,8 +13,15 @@
 //! - Read and write access are separate: a root given alone grants only its own kind of access.
 //!
 //! Roots are in force on a thread inside [`confine`], and in the whole process after
-//! [`confine_process`] (`wordcraft-cli mcp`), except inside [`unconfined`]. Without roots
-//! nothing is checked.
+//! [`confine_process`] (`wordcraft-cli mcp`), except inside [`unconfined`].
+//!
+//! Paths that name another machine or a device (`\\host\share\x`, `\\?\UNC\host\share`,
+//! `\??\UNC\host\share`, `\\.\pipe\x`) are refused by their spelling, before any file system
+//! call: on Windows merely looking one up connects to the host and hands it the user's NTLM
+//! credentials. They are refused under roots (a network path is allowed when the root itself is
+//! on the network) and, without roots, inside [`confine`] (automation: the MCP server, the app's
+//! control channel). Otherwise, without roots, nothing is checked: what the person at the
+//! keyboard opens is theirs to open.
 //!
 //! A path is checked, then opened: a process that can change the folders in between (swapping in
 //! a link) can still win that race. The roots keep an agent to the files it was given; they don't
@@ -45,6 +52,8 @@ struct Root {
     resolved: PathBuf,
     /// The same without Windows' `\\?\` prefix, for people.
     shown: PathBuf,
+    /// The folder is on another machine (a UNC root): network paths are then checked against it.
+    network: bool,
 }
 
 impl Root {
@@ -57,7 +66,8 @@ impl Root {
         let resolved = std::fs::canonicalize(path)
             .and_then(|p| if p.is_dir() { Ok(p) } else { Err(std::io::ErrorKind::NotADirectory.into()) })
             .map_err(|e| format!("cannot open the automation {kind} root `{}`: {e}", path.display()))?;
-        Ok(Self { shown: plain(resolved.clone()), resolved })
+        let network = remote_kind(&resolved.to_string_lossy()) == Some(Remote::Network);
+        Ok(Self { shown: plain(resolved.clone()), resolved, network })
     }
 }
 
@@ -85,18 +95,25 @@ impl AutomationRoots {
 
     /// May the file or folder at `path` be read (or written)? `Err` says why not.
     pub fn check(&self, path: &str, access: Access) -> Result<(), String> {
+        self.checked(path, access).map(drop)
+    }
+
+    /// [`check`](Self::check), giving the path that was checked: absolute, with its links
+    /// followed. Read or write *that* path, so the file used is the one compared with the root.
+    pub fn checked(&self, path: &str, access: Access) -> Result<PathBuf, String> {
         let root = match access {
             Access::Read => self.read.as_ref(),
             Access::Write => self.write.as_ref(),
         };
-        let Some(Root { resolved: folder, shown }) = root else {
+        let Some(Root { resolved: folder, shown, network }) = root else {
             return match access {
                 Access::Read => Err(format!("automation filesystem access is not granted: read authority is absent: {path}")),
                 Access::Write => Err(format!("automation filesystem access is not granted: write authority is absent: {path}")),
             };
         };
-        if inside(&resolve(path)?, folder) {
-            return Ok(());
+        let resolved = resolve(path, *network)?;
+        if inside(&resolved, folder) {
+            return Ok(resolved);
         }
         let root = shown.display();
         match access {
@@ -110,6 +127,9 @@ impl AutomationRoots {
 #[derive(Clone, Debug)]
 enum Scope {
     Confined(Arc<AutomationRoots>),
+    /// Automation with no roots of its own ([`confine`] with `None`): the process's roots if any,
+    /// and network and device paths refused without them.
+    Automation,
     Unconfined,
 }
 
@@ -142,12 +162,17 @@ fn with_scope<T>(scope: Option<Scope>, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Run `f` with `roots` in force on this thread (`None`: as things stand).
+/// Run `f` as automation on this thread, with `roots` in force (`None`: the roots in force
+/// already, if any). Network and device paths are refused in there, with or without roots.
 pub fn confine<T>(roots: Option<&Arc<AutomationRoots>>, f: impl FnOnce() -> T) -> T {
-    match roots {
-        Some(r) => with_scope(Some(Scope::Confined(r.clone())), f),
-        None => f(),
-    }
+    let scope = match roots {
+        Some(r) => Scope::Confined(r.clone()),
+        None => match SCOPE.with(|s| s.borrow().clone()) {
+            Some(Scope::Confined(r)) => Scope::Confined(r),
+            _ => Scope::Automation,
+        },
+    };
+    with_scope(Some(scope), f)
 }
 
 /// Run `f` with no roots in force on this thread: what the person at the keyboard does, and the
@@ -161,8 +186,13 @@ pub fn current() -> Option<Arc<AutomationRoots>> {
     match SCOPE.with(|s| s.borrow().clone()) {
         Some(Scope::Confined(r)) => Some(r),
         Some(Scope::Unconfined) => None,
-        None => PROCESS.get().cloned(),
+        Some(Scope::Automation) | None => PROCESS.get().cloned(),
     }
+}
+
+/// Is this thread running automation without roots of its own ([`confine`] with `None`)?
+fn automation() -> bool {
+    SCOPE.with(|s| matches!(*s.borrow(), Some(Scope::Automation)))
 }
 
 /// `path` without Windows' `\\?\` prefix (which `canonicalize` adds), for people to read.
@@ -180,27 +210,102 @@ fn plain(path: PathBuf) -> PathBuf {
     }
 }
 
-/// May `path` be read here? Always, without roots in force.
+/// May `path` be read here? Always without roots in force, unless automation names another
+/// machine or a device.
 pub fn check_read(path: &str) -> Result<(), String> {
-    current().map_or(Ok(()), |r| r.check(path, Access::Read))
+    checked_read(path).map(drop)
 }
 
-/// May `path` be written here? Always, without roots in force.
+/// May `path` be written here? Always without roots in force, unless automation names another
+/// machine or a device.
 pub fn check_write(path: &str) -> Result<(), String> {
-    current().map_or(Ok(()), |r| r.check(path, Access::Write))
+    checked_write(path).map(drop)
+}
+
+/// [`check_read`], giving the path to read: the one checked against the read root (absolute,
+/// links followed) when roots are in force, else `path` as given.
+pub fn checked_read(path: &str) -> Result<PathBuf, String> {
+    checked(path, Access::Read)
+}
+
+/// [`check_write`], giving the path to write: the one checked against the write root (absolute,
+/// links followed) when roots are in force, else `path` as given.
+pub fn checked_write(path: &str) -> Result<PathBuf, String> {
+    checked(path, Access::Write)
+}
+
+fn checked(path: &str, access: Access) -> Result<PathBuf, String> {
+    match current() {
+        Some(roots) => roots.checked(path, access),
+        None => {
+            if automation() {
+                refuse_remote(path, false)?;
+            }
+            Ok(PathBuf::from(path))
+        }
+    }
+}
+
+/// What a path's spelling alone says it names, without asking the file system.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Remote {
+    /// A share on another machine: `\\host\share\x`, `//host/share/x`, `\\?\UNC\host\share\x`.
+    Network,
+    /// A device or the NT object namespace: `\\.\pipe\x`, `\\.\C:`, `\\?\GLOBALROOT\…`,
+    /// `\??\UNC\host\share`.
+    Device,
+}
+
+/// What `path` names by its spelling ([`Remote`]), on every system alike (Windows reads `/` as
+/// `\`). A local path, verbatim ones included (`\\?\C:\x`, as `canonicalize` gives them), is
+/// `None`.
+fn remote_kind(path: &str) -> Option<Remote> {
+    let sep = |c: &u8| *c == b'\\' || *c == b'/';
+    match path.as_bytes() {
+        // `\??\…`: the NT object namespace, which Windows passes through as it is.
+        [a, b'?', b'?', b, ..] if sep(a) && sep(b) => Some(Remote::Device),
+        [a, b, rest @ ..] if sep(a) && sep(b) => match rest {
+            [b'?', b'\\', d, b':', b'\\', ..] if d.is_ascii_alphabetic() => None,
+            [b'?', s, u, n, c, t, ..] if sep(s) && sep(t) && [*u, *n, *c].eq_ignore_ascii_case(b"UNC") => Some(Remote::Network),
+            [b'?' | b'.'] => Some(Remote::Device),
+            [b'?' | b'.', s, ..] if sep(s) => Some(Remote::Device),
+            _ => Some(Remote::Network),
+        },
+        _ => None,
+    }
+}
+
+/// Does `path` name another machine or a device by its spelling (`\\host\share`, `//host/share`,
+/// `\\?\UNC\…`, `\??\…`, `\\.\…`)? Lexical: nothing is looked up, so nothing connects.
+pub fn is_network_or_device_path(path: &str) -> bool {
+    remote_kind(path).is_some()
+}
+
+/// `Err` when `path` names a device, or another machine unless `network` allows it.
+fn refuse_remote(path: &str, network: bool) -> Result<(), String> {
+    match remote_kind(path) {
+        Some(Remote::Network) if !network => Err(format!("automation path rejected: network paths are not allowed: {path}")),
+        Some(Remote::Device) => Err(format!("automation path rejected: device paths are not allowed: {path}")),
+        _ => Ok(()),
+    }
 }
 
 /// `path` made absolute with its links followed; for a path that doesn't exist (yet), its nearest
-/// existing folder's links followed and the rest appended.
-fn resolve(path: &str) -> Result<PathBuf, String> {
+/// existing folder's links followed and the rest appended. A network path (allowed only when
+/// `network`: the root is on the network) or a device path is refused by its spelling first,
+/// before the file system is asked anything.
+fn resolve(path: &str, network: bool) -> Result<PathBuf, String> {
     if path.is_empty() {
         return Err("automation path rejected: path is empty".into());
     }
+    refuse_remote(path, network)?;
     // Checked as given: making `…\NUL` absolute gives the device path `\\.\NUL` on Windows.
     if cfg!(windows) && Path::new(path).components().any(|c| matches!(c, Component::Normal(n) if is_device_name(&n.to_string_lossy()))) {
         return Err(format!("automation path rejected: reserved device names are not allowed: {path}"));
     }
     let absolute = std::path::absolute(path).map_err(|e| format!("automation path rejected: cannot resolve {path}: {e}"))?;
+    // A relative path from a working directory on a share is on the network too.
+    refuse_remote(&absolute.to_string_lossy(), network)?;
     // The names below the nearest existing folder, last first.
     let mut missing: Vec<OsString> = vec![];
     let mut at = absolute.as_path();
@@ -424,6 +529,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    /// Network and device paths are told by their spelling alone, on every system (#2746).
+    #[test]
+    fn network_and_device_paths_are_told_by_their_spelling() {
+        for p in [r"\\192.0.2.1\s\x.docx", "//host/share/x.docx", r"\/host\share", r"\\host", r"\\?\UNC\h\s\x", r"\\?\unc\h\s", "//?/UNC/h/s"] {
+            assert_eq!(remote_kind(p), Some(Remote::Network), "{p}");
+        }
+        for p in
+            [r"\??\UNC\h\s", r"\??\C:\x", "/??/UNC/h/s", r"\\.\pipe\x", r"\\.\C:", r"\\.", r"\\?", r"\\?\GLOBALROOT\x", r"\\?\C:", r"\\?\Volume{0}\x"]
+        {
+            assert_eq!(remote_kind(p), Some(Remote::Device), "{p}");
+        }
+        for p in [r"C:\x.docx", "/home/u/x.docx", r"\x.docx", "x.docx", r"\\?\C:\x.docx", "", r"\", "?", r"a\\b", "./x"] {
+            assert_eq!(remote_kind(p), None, "{p}");
+        }
+        assert!(is_network_or_device_path(r"\\?\UNC\h\s\x") && !is_network_or_device_path(r"C:\x"));
+    }
+
+    /// Under roots, a network or device path is refused before anything is looked up: on Windows
+    /// a look-up would connect to the host and send it the user's NTLM credentials (#2746). The
+    /// message says so, where a look-up would have said `cannot resolve` (or `outside`).
+    #[test]
+    fn network_and_device_paths_are_refused_before_any_look_up() {
+        let (base, roots) = folders("unc");
+        for p in [r"\\192.0.2.1\s\x.docx", r"\\?\UNC\h\s\x", "//192.0.2.1/s/x.docx"] {
+            for access in [Access::Read, Access::Write] {
+                let e = roots.check(p, access).unwrap_err();
+                assert!(e.starts_with("automation path rejected: network paths are not allowed"), "{p}: {e}");
+            }
+        }
+        for p in [r"\??\UNC\h\s", r"\\.\pipe\x"] {
+            let e = roots.check(p, Access::Read).unwrap_err();
+            assert!(e.starts_with("automation path rejected: device paths are not allowed"), "{p}: {e}");
+        }
+        // A root on the network lets network paths be compared with it; devices stay refused.
+        let unc =
+            AutomationRoots { read: Some(Root { resolved: PathBuf::from(r"\\?\UNC\nas\share"), shown: PathBuf::new(), network: true }), write: None };
+        assert!(!unc.check(r"\\.\pipe\x", Access::Read).unwrap_err().contains("network paths"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Without roots, automation ([`confine`] with `None`) still refuses network and device
+    /// paths; the person at the keyboard (no scope, or [`unconfined`]) may open them.
+    #[test]
+    fn automation_without_roots_refuses_network_and_device_paths() {
+        let share = r"\\192.0.2.1\s\x.docx";
+        assert_eq!(checked_read(share), Ok(PathBuf::from(share)), "not automation: nothing is checked");
+        confine(None, || {
+            assert!(check_read(share).unwrap_err().contains("network paths are not allowed"));
+            assert!(check_write(r"\??\UNC\h\s\x.docx").unwrap_err().contains("device paths are not allowed"));
+            assert_eq!(checked_write("x.docx"), Ok(PathBuf::from("x.docx")), "local paths are as before");
+            assert_eq!(unconfined(|| check_read(share)), Ok(()));
+        });
+        assert_eq!(check_read(share), Ok(()), "restored after confine");
+    }
+
+    /// The path to read or write is the one that was checked, links followed (#2774).
+    #[test]
+    fn the_checked_path_is_the_one_compared_with_the_root() {
+        let (base, roots) = folders("checked");
+        let sep = std::path::MAIN_SEPARATOR;
+        let via = format!("{}{sep}..{sep}a.docx", s(base.join("in/sub")));
+        let got = confine(Some(&roots), || checked_read(&via)).unwrap();
+        assert_eq!(got, std::fs::canonicalize(base.join("in/a.docx")).unwrap());
+        let new = confine(Some(&roots), || checked_write(&s(base.join("out/new.png")))).unwrap();
+        assert_eq!(new, std::fs::canonicalize(base.join("out")).unwrap().join("new.png"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn device_names() {
         for d in ["CON", "nul", "Com1", "LPT9.txt", "aux.docx", "NUL "] {
@@ -472,12 +645,29 @@ mod tests {
             let code = text.split("#[cfg(test)]").next().unwrap_or("");
             for (n, line) in code.lines().enumerate() {
                 let line = line.trim_start();
-                let touches = ["std::fs", "File::open", "File::create", "OpenOptions"].iter().any(|w| line.contains(w));
+                // Probes too: asking whether a path is a folder reaches the file system (and, on
+                // Windows, a network share) just as opening it does (#2775).
+                let touches = [
+                    "std::fs",
+                    "File::open",
+                    "File::create",
+                    "OpenOptions",
+                    ".is_dir()",
+                    ".is_file()",
+                    ".exists()",
+                    "try_exists(",
+                    "canonicalize(",
+                    "metadata(",
+                    "read_dir(",
+                    "read_link(",
+                ]
+                .iter()
+                .any(|w| line.contains(w));
                 if !line.starts_with("//") && touches {
                     offenders.push(format!("{}:{}: {line}", path.display(), n + 1));
                 }
             }
         }
-        assert!(offenders.is_empty(), "use crate::io::{{read_file, write_file, open_path_with, save_path_with}}: {offenders:#?}");
+        assert!(offenders.is_empty(), "use crate::io::{{read_file, write_file, open_path_with, save_path_with, is_folder}}: {offenders:#?}");
     }
 }
