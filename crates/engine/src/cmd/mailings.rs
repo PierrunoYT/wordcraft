@@ -915,6 +915,49 @@ pub fn refresh(s: &mut Session) {
 
 /// Most merged documents' worth of body blocks Finish & Merge builds.
 const MAX_MERGED_BLOCKS: usize = 200_000;
+/// Most work Finish & Merge does in all, in [`merge_units`] (about one per character copied): every
+/// record deep-copies the body, so a big body (a long table, a megabyte paragraph) over many
+/// records would otherwise need gigabytes (WC-27).
+const MAX_MERGED_UNITS: usize = 50_000_000;
+
+/// What one merged copy of `blocks` costs: its text bytes, plus one per paragraph and one per
+/// table cell, nested tables included (as deep as the merge descends).
+fn merge_units(blocks: &Blocks, depth: usize) -> usize {
+    if depth > MAX_DEPTH {
+        return 0;
+    }
+    blocks.iter().fold(0usize, |n, b| {
+        n.saturating_add(match &**b {
+            Block::Para(p) => p.text.len().saturating_add(1),
+            Block::Table(t) => {
+                t.rows.iter().flat_map(|r| &r.cells).fold(0usize, |n, c| n.saturating_add(1).saturating_add(merge_units(&c.blocks, depth + 1)))
+            }
+        })
+    })
+}
+
+/// Unconditional NEXT fields in `blocks`: each moves a merged copy on by one more record.
+fn next_fields(blocks: &Blocks, depth: usize) -> usize {
+    if depth > MAX_DEPTH {
+        return 0;
+    }
+    blocks.iter().fold(0usize, |n, b| {
+        n.saturating_add(match &**b {
+            Block::Para(p) => p
+                .objects
+                .iter()
+                .filter(|o| matches!(o, InlineObject::Field { instr, .. } if mergefield_name(instr.trim()).is_none() && keyword(instr) == "NEXT"))
+                .count(),
+            Block::Table(t) => t.rows.iter().flat_map(|r| &r.cells).fold(0usize, |n, c| n.saturating_add(next_fields(&c.blocks, depth + 1))),
+        })
+    })
+}
+
+fn too_large(units: usize, records: usize) -> CmdError {
+    CmdError::Failed(format!(
+        "the merged document would be too large (about {units} characters for {records} records; the limit is {MAX_MERGED_UNITS}): merge fewer records at a time with From and To"
+    ))
+}
 
 /// Build one merged copy per record: fields become plain text; records separated by page breaks
 /// (letters) or new paragraphs (directory). A true SKIPIF drops the record's copy; NEXT moves the
@@ -929,6 +972,18 @@ fn finish(s: &mut Session, v: &Value) -> CmdResult {
     let hf: Vec<u32> =
         header_footer_ids(&s.doc).into_iter().filter(|id| s.doc.story(StoryRef::Part(*id)).is_some_and(|b| has_merge_fields(b, 0))).collect();
     let per_record = !directory && !hf.is_empty();
+    // Refuse a merge that can't fit before copying anything: one copy's size times the copies
+    // (records, fewer when NEXT fields put several records in one copy).
+    let hf_units =
+        if per_record { hf.iter().filter_map(|id| s.doc.parts.get(id)).fold(0usize, |n, p| n.saturating_add(merge_units(&p.blocks, 0))) } else { 0 };
+    let per_copy = merge_units(&s.doc.body, 0).saturating_add(hf_units);
+    let records = to.saturating_sub(from);
+    let estimate = records.div_ceil(next_fields(&s.doc.body, 0).saturating_add(1)).saturating_mul(per_copy);
+    if estimate > MAX_MERGED_UNITS {
+        return Err(too_large(estimate, records));
+    }
+    // What has been copied so far: field values can make a copy larger than its template.
+    let mut units = 0usize;
     let mut out = s.doc.clone();
     out.body.clear();
     let mut next_id = s.doc.parts.keys().next_back().map_or(1, |k| k.saturating_add(1));
@@ -946,6 +1001,10 @@ fn finish(s: &mut Session, v: &Value) -> CmdResult {
         if !keep {
             continue;
         }
+        units = units.saturating_add(merge_units(&body, 0));
+        if units > MAX_MERGED_UNITS {
+            return Err(too_large(units, records));
+        }
         first_record.get_or_insert(record);
         if per_record {
             // This letter's own header/footer copies, merged with its record.
@@ -958,6 +1017,10 @@ fn finish(s: &mut Session, v: &Value) -> CmdResult {
                 let mut blocks = part.blocks.clone();
                 let mut c = record;
                 merge_blocks(s, &mut blocks, &mut c, to, 0);
+                units = units.saturating_add(merge_units(&blocks, 0));
+                if units > MAX_MERGED_UNITS {
+                    return Err(too_large(units, records));
+                }
                 out.parts.insert(next_id, Part { kind: part.kind, blocks, body: part.body });
                 map.push((*id, next_id));
                 next_id += 1;
@@ -1866,5 +1929,52 @@ mod tests {
         assert!(s.merge.rows.is_empty());
         assert!(s.run("mailings.finish", &json!({})).is_err());
         assert!(s.run("mailings.editRecipients", &json!({})).is_ok());
+    }
+
+    fn with_recipients(doc: Document, values: &[String]) -> Session {
+        let mut s = Session::new(doc);
+        let csv = format!("Name\n{}", values.iter().map(|v| format!("{v}\n")).collect::<String>());
+        s.run("mailings.recipients", &json!({"csv": csv})).unwrap();
+        s.run("mailings.insertField", &json!({"field": "Name"})).unwrap();
+        s
+    }
+
+    fn assert_too_large(s: &mut Session, v: &Value) {
+        let text = s.doc.plain_text(StoryRef::Body);
+        let err = s.run("mailings.finish", v).unwrap_err().to_string();
+        assert!(err.contains("too large") && err.contains("From and To"), "{err}");
+        assert_eq!(s.doc.plain_text(StoryRef::Body), text, "a refused merge leaves the document alone");
+    }
+
+    /// WC-27: a merge is refused before it copies anything when one copy times the records is
+    /// over budget: a megabyte paragraph over 100 records.
+    #[test]
+    fn finish_refuses_a_big_body_over_many_records() {
+        let mut s = with_recipients(Document::from_text(&"x".repeat(1 << 20)), &vec!["Ann".to_string(); 100]);
+        assert_too_large(&mut s, &json!({}));
+        // A range of records that fits merges.
+        assert_eq!(s.run("mailings.finish", &json!({"from": 1, "to": 10})).unwrap()["records"], 10);
+    }
+
+    /// WC-27: table cells count, not just top-level blocks: one 200 × 50 table (two blocks per
+    /// copy) over 3000 records is 30 million copied cells.
+    #[test]
+    fn finish_counts_copied_table_cells() {
+        let mut doc = Document::new();
+        doc.body.insert(0, std::sync::Arc::new(Block::Table(Table::new(200, 50, 400.0))));
+        doc.ensure_nonempty();
+        let mut s = with_recipients(doc, &vec!["Ann".to_string(); 3000]);
+        assert_too_large(&mut s, &json!({}));
+        s.run("mailings.finish", &json!({"to": 20})).unwrap();
+        assert_eq!(s.doc.body.iter().filter(|b| matches!(&***b, Block::Table(_))).count(), 20);
+    }
+
+    /// WC-27: field values are counted as they are copied, so a small letter whose records hold
+    /// megabytes each stops with the same error.
+    #[test]
+    fn finish_counts_merged_field_values() {
+        let mut s = with_recipients(Document::new(), &vec!["y".repeat(5 << 20); 11]);
+        assert_too_large(&mut s, &json!({}));
+        assert_eq!(s.run("mailings.finish", &json!({"to": 2})).unwrap()["records"], 2);
     }
 }
