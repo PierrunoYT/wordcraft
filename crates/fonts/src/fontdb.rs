@@ -643,6 +643,7 @@ fn file_face_names(path: &std::path::Path) -> Vec<Found> {
     };
     let be32 = |b: &[u8], at: usize| b.get(at..at + 4).and_then(|s| s.try_into().ok()).map(u32::from_be_bytes);
     let Some(head) = read_at(0, 12) else { return vec![] };
+    let mut instances = MAX_INSTANCES_READ;
     // A collection lists where each face's table directory starts.
     let starts: Vec<u32> = if head.starts_with(b"ttcf") {
         let n = be32(&head, 8).unwrap_or(0).min(MAX_FACES) as usize;
@@ -671,7 +672,7 @@ fn file_face_names(path: &std::path::Path) -> Vec<Found> {
             tables.push((*b"name", name));
             // A font holding just those tables, to read them as the font itself would.
             let font = mini_font(&tables);
-            Some(font_faces(&skrifa::FontRef::new(&font).ok()?, 0))
+            Some(font_faces(&skrifa::FontRef::new(&font).ok()?, 0, MAX_FACES_PER_FILE, &mut instances))
         })
         .flatten()
         .collect()
@@ -757,17 +758,34 @@ struct Found {
     coords: Vec<([u8; 4], f32)>,
 }
 
+/// Most faces one font file yields: collection members and variable fonts' named instances
+/// together. Font files are hostile input (a document embeds them): a collection can declare
+/// millions of members that share one table directory, a variable font 65,535 named instances.
+pub(crate) const MAX_FACES_PER_FILE: usize = 256;
+/// Most faces [`FontDb::add_fonts`] reads from one batch of files (a document's embedded fonts).
+const MAX_FACES_PER_BATCH: usize = 4 * MAX_FACES_PER_FILE;
+/// Most named instances looked at in one font file: each costs a `name` table lookup, and
+/// instances whose names are missing or repeated yield no face.
+const MAX_INSTANCES_READ: usize = 4 * MAX_FACES_PER_FILE;
+
 /// The faces of `f` (face `index` of its file): one per named instance of a variable font
-/// (InDesign lists them as styles), otherwise the font itself.
-fn font_faces(f: &skrifa::FontRef<'_>, index: u32) -> Vec<Found> {
+/// (InDesign lists them as styles), otherwise the font itself. At most `max` faces (and at least
+/// one when the font has names); each named instance looked at takes one from `instances`.
+fn font_faces(f: &skrifa::FontRef<'_>, index: u32, max: usize, instances: &mut usize) -> Vec<Found> {
     let Some((family, style, id1)) = face_names(f) else { return vec![] };
     let local = local_names(f, &family, id1.as_deref());
     let east_asian = east_asian_font(f);
     let axes = f.axes();
     let mut named: Vec<Found> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for ni in f.named_instances().iter() {
+        if named.len() >= max {
+            break;
+        }
+        let Some(left) = instances.checked_sub(1) else { break };
+        *instances = left;
         let Some(style) = name(f, &[ni.subfamily_name_id()]) else { continue };
-        if named.iter().any(|n| n.style.eq_ignore_ascii_case(&style)) {
+        if !seen.insert(style.to_ascii_lowercase()) {
             continue;
         }
         let coords: Vec<([u8; 4], f32)> = axes.iter().zip(ni.user_coords()).map(|(a, v)| (a.tag().to_be_bytes(), v)).collect();
@@ -784,15 +802,29 @@ fn font_faces(f: &skrifa::FontRef<'_>, index: u32) -> Vec<Found> {
     vec![Found { index, family, style, legacy, local, east_asian, coords: Vec::new() }]
 }
 
-/// Parse every face in `data` (a font file or collection); a variable font yields one face per
-/// named instance.
+/// Parse the faces in `data` (a font file or collection); a variable font yields one face per
+/// named instance. At most [`MAX_FACES_PER_FILE`], the first in file order.
 fn enumerate_faces(data: &[u8]) -> Vec<Found> {
+    enumerate_faces_up_to(data, MAX_FACES_PER_FILE)
+}
+
+/// [`enumerate_faces`], stopping after `max` faces: only the first `max` members of a collection
+/// are read, and named instances count towards the limit.
+fn enumerate_faces_up_to(data: &[u8], max: usize) -> Vec<Found> {
     let count = match FileRef::new(data) {
         Ok(FileRef::Font(_)) => 1,
-        Ok(FileRef::Collection(c)) => c.len(),
+        Ok(FileRef::Collection(c)) => c.len().min(u32::try_from(max).unwrap_or(u32::MAX)),
         Err(_) => 0,
     };
-    (0..count).filter_map(|i| skrifa::FontRef::from_index(data, i).ok().map(|f| font_faces(&f, i))).flatten().collect()
+    let mut found = Vec::new();
+    let mut instances = MAX_INSTANCES_READ;
+    for i in 0..count {
+        let Some(left) = max.checked_sub(found.len()).filter(|&n| n > 0) else { break };
+        if let Ok(f) = skrifa::FontRef::from_index(data, i) {
+            found.extend(font_faces(&f, i, left, &mut instances));
+        }
+    }
+    found
 }
 
 /// The compiled-in Source Sans 3 Regular, for a database that somehow has no faces at all.
@@ -1081,19 +1113,30 @@ impl FontDb {
     /// added.
     fn add_fonts(&self, files: Vec<Vec<u8>>) -> usize {
         let mut new = Vec::new();
+        let mut read = 0usize;
         for bytes in files {
             let data = Arc::new(bytes);
-            for f in enumerate_faces(&data) {
+            let left = MAX_FACES_PER_BATCH.saturating_sub(read).min(MAX_FACES_PER_FILE);
+            if left == 0 {
+                log::warn!("more than {MAX_FACES_PER_BATCH} font faces at once; the rest are not loaded");
+                break;
+            }
+            let found = enumerate_faces_up_to(&data, left);
+            read = read.saturating_add(found.len());
+            for f in found {
                 if let Some(mut face) = make_face(FontBytes::Owned(data.clone()), f.index, f.family, f.style, f.legacy, f.coords) {
                     face.local_names = f.local;
                     new.push(Arc::new(face));
                 }
             }
         }
+        let key = |f: &FontFace| (f.family.to_ascii_lowercase(), f.style.to_ascii_lowercase());
         let mut faces = self.faces.write().unwrap_or_else(|e| e.into_inner());
+        // One set lookup per new face, not a scan of every loaded face (WC-18).
+        let mut present: std::collections::HashSet<(String, String)> = faces.iter().map(|f| key(f)).collect();
         let mut added = 0;
         for f in new {
-            if !faces.iter().any(|g| g.family.eq_ignore_ascii_case(&f.family) && g.style.eq_ignore_ascii_case(&f.style)) {
+            if present.insert(key(&f)) {
                 faces.push(f);
                 added += 1;
             }

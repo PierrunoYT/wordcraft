@@ -17,14 +17,12 @@ use std::sync::atomic::Ordering;
 use skrifa::MetadataProvider;
 use skrifa::raw::FileRef;
 
-use super::{FontBytes, FontDb, enumerate_faces, make_face};
+use super::{FontBytes, FontDb, MAX_FACES_PER_FILE, enumerate_faces_up_to, make_face};
 
 /// Largest font file accepted (as given: TTF, OTF, TTC, WOFF or WOFF2).
 pub const MAX_FONT_FILE_BYTES: usize = 50 << 20;
 /// Largest font a WOFF/WOFF2 file may unwrap to.
 const MAX_DECODED_BYTES: usize = 128 << 20;
-/// Most faces one file may add (collections, variable fonts' named instances).
-const MAX_FACES_PER_FILE: usize = 256;
 /// Most user fonts at once.
 const MAX_USER_FONTS: usize = 1000;
 /// File extensions [`FontDb::load_user_fonts`] reads (fonts are stored unwrapped).
@@ -292,7 +290,8 @@ impl FontDb {
         if FileRef::new(&sfnt).is_err() {
             return Err(UserFontError::Unusable("not a valid OpenType file".into()));
         }
-        let found = enumerate_faces(&sfnt);
+        // One more than allowed, to tell a file that has too many.
+        let found = enumerate_faces_up_to(&sfnt, MAX_FACES_PER_FILE + 1);
         if found.is_empty() {
             return Err(UserFontError::Unusable("no face with a family name".into()));
         }
@@ -747,6 +746,108 @@ mod tests {
         let regular = renamed("SourceSans3-Regular.ttf", FAMILY);
         assert_eq!(woff1_sfnt_size(&woff1(&regular)), Some(regular.len() as u64));
         assert!(decode_font_file(&woff1(&regular)).is_ok());
+    }
+
+    /// `font` (a TrueType file) as a collection of `members` faces that all share its one table
+    /// directory.
+    fn collection_of(font: &[u8], members: u32) -> Vec<u8> {
+        let base = 12 + 4 * members;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ttcf");
+        out.extend_from_slice(&[0, 1, 0, 0]);
+        out.extend_from_slice(&members.to_be_bytes());
+        for _ in 0..members {
+            out.extend_from_slice(&base.to_be_bytes());
+        }
+        let mut f = font.to_vec();
+        let n = u16::from_be_bytes([f[4], f[5]]) as usize;
+        for i in 0..n {
+            let at = 12 + i * 16 + 8;
+            let off = u32::from_be_bytes(f[at..at + 4].try_into().unwrap());
+            f[at..at + 4].copy_from_slice(&(off + base).to_be_bytes());
+        }
+        out.extend(f);
+        out
+    }
+
+    /// A font holding only `name` and `fvar` tables: family `family`, and `instances` named
+    /// instances of one `wght` axis, which take `styles` style names in turn.
+    fn many_instances(family: &str, instances: u16, styles: u16) -> Vec<u8> {
+        let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>();
+        let mut names: Vec<(u16, Vec<u8>)> = vec![(1, utf16(family)), (2, utf16("Regular"))];
+        names.extend((0..styles).map(|i| (256 + i, utf16(&format!("Style {i}")))));
+        let mut name = Vec::new();
+        let records = 6 + 12 * names.len();
+        for v in [0u16, names.len() as u16, records as u16] {
+            name.extend_from_slice(&v.to_be_bytes());
+        }
+        let mut strings = Vec::new();
+        for (id, s) in &names {
+            for v in [3u16, 1, 0x409, *id, s.len() as u16, strings.len() as u16] {
+                name.extend_from_slice(&v.to_be_bytes());
+            }
+            strings.extend_from_slice(s);
+        }
+        name.extend(strings);
+        let mut fvar = Vec::new();
+        for v in [1u16, 0, 16, 2, 1, 20, instances, 8] {
+            fvar.extend_from_slice(&v.to_be_bytes());
+        }
+        fvar.extend_from_slice(b"wght");
+        for v in [100u32, 400, 900] {
+            fvar.extend_from_slice(&(v << 16).to_be_bytes());
+        }
+        fvar.extend_from_slice(&[0, 0, 0, 2]);
+        for i in 0..instances {
+            fvar.extend_from_slice(&(256 + i % styles).to_be_bytes());
+            fvar.extend_from_slice(&[0, 0]);
+            fvar.extend_from_slice(&((100 + u32::from(i) % 800) << 16).to_be_bytes());
+        }
+        let tables = [(*b"fvar", fvar), (*b"name", name)];
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0, 1, 0, 0]);
+        out.extend_from_slice(&(tables.len() as u16).to_be_bytes());
+        out.extend_from_slice(&[0; 6]);
+        let mut offset = 12 + 16 * tables.len();
+        for (tag, data) in &tables {
+            out.extend_from_slice(tag);
+            out.extend_from_slice(&[0; 4]);
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            offset += data.len().next_multiple_of(4);
+        }
+        for (_, data) in &tables {
+            out.extend_from_slice(data);
+            out.resize(out.len().next_multiple_of(4), 0);
+        }
+        out
+    }
+
+    #[test]
+    fn embedded_font_faces_are_capped() {
+        // WC-18: a collection declaring 100,000 members that share one table directory, opened
+        // as a document's embedded font, reads 256 of them, not every one.
+        let start = std::time::Instant::now();
+        let ttc = collection_of(&renamed("SourceSans3-Regular.ttf", "Embedfont Abc"), 100_000);
+        assert_eq!(super::super::enumerate_faces(&ttc).len(), MAX_FACES_PER_FILE);
+        let db = db();
+        assert_eq!(db.add_document_fonts(vec![ttc.clone(), ttc.clone()]), 1, "the same face once");
+        assert!(db.has_family("Embedfont Abc"));
+        // Installing it is refused rather than truncated.
+        assert!(matches!(db.install_font("big.ttc", &ttc), Err(UserFontError::Unusable(_))));
+        // A variable font with 20,000 named instances (2,000 style names; the name table holds at
+        // most 64 KB of text): 256 faces, in file order.
+        let var = many_instances("Manyfont", 20_000, 2_000);
+        let found = super::super::enumerate_faces(&var);
+        assert_eq!(found.len(), MAX_FACES_PER_FILE);
+        assert_eq!(found[0].style, "Style 0");
+        assert_eq!(found[255].style, "Style 255");
+        // Repeated style names are still listed once.
+        let styles: Vec<String> = super::super::enumerate_faces(&many_instances("Fewfont", 9, 3)).into_iter().map(|f| f.style).collect();
+        assert_eq!(styles, ["Style 0", "Style 1", "Style 2"]);
+        // 20,000 instances sharing one name: a bounded number are looked at, one face results.
+        assert_eq!(super::super::enumerate_faces(&many_instances("Samefont", 20_000, 1)).len(), 1);
+        assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
     }
 
     #[test]
