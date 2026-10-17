@@ -1262,6 +1262,14 @@ impl Document {
         }
     }
 
+    /// Make a model read from untrusted JSON (a `.json` document, a recovery snapshot) safe to
+    /// edit and lay out: repair every paragraph's runs ([`Self::normalize_runs`]) and give every
+    /// story and table cell a paragraph ([`Self::ensure_nonempty`]).
+    pub fn repair_untrusted(&mut self) {
+        self.normalize_runs();
+        self.ensure_nonempty();
+    }
+
     /// Number of paragraphs in the body (all depths).
     pub fn paragraph_count(&self) -> usize {
         self.para_paths(StoryRef::Body).len()

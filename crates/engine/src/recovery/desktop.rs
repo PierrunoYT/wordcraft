@@ -285,7 +285,11 @@ impl Store {
             return Err("no such recovery copy".into());
         }
         self.acquire(id)?;
-        read_snapshot(&self.entries.get(id).ok_or("no such recovery copy")?.path)
+        let mut s = read_snapshot(&self.entries.get(id).ok_or("no such recovery copy")?.path)?;
+        // A snapshot is untrusted JSON, like a `.json` document: a damaged but parseable copy is
+        // repaired here, on the worker, before the session edits or lays it out (WC-37).
+        s.document.repair_untrusted();
+        Ok(s)
     }
     fn discard(&mut self, id: &str) -> Result<(), String> {
         if !id_ok(id) {
@@ -660,6 +664,50 @@ mod tests {
         });
         assert_eq!(fs::read(&original).unwrap(), b"External synthetic original");
         assert_eq!(fs::read_dir(&files.0).unwrap().count(), 1);
+    }
+
+    /// WC-37: a damaged but parseable snapshot (runs that overflow the text or split a character,
+    /// a body ending in a table with an empty cell, an empty header story) is repaired as a
+    /// `.json` document is, before the session edits or lays it out.
+    #[test]
+    fn a_damaged_snapshot_is_repaired_before_it_is_restored() {
+        use wordcraft_doc::{Block, Part, PartKind, Run, Table};
+        let profile = Temp::new();
+        let id = new_id().unwrap();
+        let mut damaged = snapshot(&id, "Damaged synthetic draft \u{e9}");
+        damaged.generation = 1;
+        if let Some(Block::Para(p)) = damaged.document.body.first_mut().map(Arc::make_mut) {
+            let split = p.text.len() - 1;
+            p.runs = vec![Run { len: split, props: Default::default() }, Run { len: 1 << 20, props: Default::default() }];
+        }
+        let mut table = Table::new(1, 2, 200.0);
+        if let Some(cell) = table.rows.first_mut().and_then(|r| r.cells.first_mut()) {
+            cell.blocks.clear();
+        }
+        damaged.document.body.push(Arc::new(Block::Table(table)));
+        damaged.document.parts.insert(90, Part { kind: PartKind::Header, blocks: Vec::new(), body: Default::default() });
+        let dir = profile.0.join(&id);
+        private_dir(&dir).unwrap();
+        fs::write(dir.join(format!("snapshot-{:020}.json", 1)), serde_json::to_vec(&damaged).unwrap()).unwrap();
+
+        let mut s = session(&profile.0);
+        assert_eq!(s.recovery_documents().len(), 1, "the damaged copy still parses and is listed");
+        s.run("file.recover", &json!({"restore": id})).unwrap();
+        settle(&mut s);
+        assert!(s.recovery_error().is_none(), "{:?}", s.recovery_error());
+        assert_eq!(s.doc.plain_text(StoryRef::Body).lines().next(), Some("Damaged synthetic draft \u{e9}"));
+        for path in s.doc.para_paths(StoryRef::Body) {
+            let p = s.doc.para(StoryRef::Body, &path).unwrap();
+            assert_eq!(p.runs.iter().map(|r| r.len).sum::<usize>(), p.text.len(), "runs cover the text exactly");
+        }
+        assert!(matches!(s.doc.body.last().map(|b| &**b), Some(Block::Para(_))), "a paragraph follows the table");
+        assert!(s.doc.parts.get(&90).is_some_and(|p| !p.blocks.is_empty()), "the header story has a paragraph");
+        let Some(Block::Table(t)) = s.doc.body.iter().map(|b| &**b).find(|b| matches!(b, Block::Table(_))) else { panic!("the table is kept") };
+        assert!(t.rows.iter().flat_map(|r| &r.cells).all(|c| !c.blocks.is_empty()), "every cell has a paragraph");
+        // Editing and layout work on the restored document.
+        s.run("select.all", &json!({})).unwrap();
+        s.run("text.insert", &json!({"text": "Edited"})).unwrap();
+        assert!(!s.layout().pages.is_empty());
     }
 
     #[test]
