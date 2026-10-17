@@ -857,10 +857,12 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
                 let rest = s.get(i + 1..).unwrap_or("");
                 let end = within(rest, MAX_TAG).find('>');
                 let inner = end.and_then(|e| rest.get(..e)).unwrap_or("");
-                let lower = inner.to_ascii_lowercase();
+                // Compared in place: lower-casing copies (of the tag, or of the rest of the
+                // paragraph) made every `<` cost the length of the text.
+                let prefix = |s: &str, p: &str| s.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p));
                 let is_auto = !inner.is_empty()
                     && !inner.contains([' ', '<', '\n'])
-                    && (inner.contains("://") || lower.starts_with("mailto:") || (inner.contains('@') && !inner.contains('/')));
+                    && (inner.contains("://") || prefix(inner, "mailto:") || (inner.contains('@') && !inner.contains('/')));
                 if is_auto {
                     flush!();
                     let mut f = base.clone();
@@ -868,12 +870,12 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
                     push_text(&mut nodes, inner, &f);
                     i += inner.len() + 2;
                     text_start = i;
-                } else if matches!(lower.trim_end_matches('/').trim(), "br") {
+                } else if inner.trim_end_matches('/').trim().eq_ignore_ascii_case("br") {
                     flush!();
                     push_text(&mut nodes, "\n", base);
                     i += inner.len() + 2;
                     text_start = i;
-                } else if lower.starts_with("a ") && rest.get(inner.len() + 1..).is_some_and(|r| r.to_ascii_lowercase().starts_with("</a>")) {
+                } else if prefix(inner, "a ") && rest.get(inner.len() + 1..).is_some_and(|r| prefix(r, "</a>")) {
                     flush!();
                     if let Some(name) = tag_attr(inner, "id").or_else(|| tag_attr(inner, "name")) {
                         nodes.push(Node::Inl(Inline::Anchor(name)));
@@ -1019,18 +1021,15 @@ fn emit(mut nodes: Vec<Node>) -> Vec<Inline> {
         }
         out.push(Inline::Text(t.to_string(), f));
     };
-    let base_of = |nodes: &[Node], k: usize| -> Fmt {
-        // Delimiter literals take the formatting (link, …) of neighbouring text.
-        for j in (0..k).rev() {
-            if let Some(Node::Text(_, f)) = nodes.get(j) {
-                return Fmt { bold: false, italic: false, strike: false, ..f.clone() };
-            }
-        }
-        Fmt::default()
-    };
-    for (k, n) in nodes.iter().enumerate() {
+    // Delimiter literals take the formatting (link, …) of the text before them, kept as we go:
+    // looking back for it from every delimiter was quadratic in a run of them.
+    let mut last_text: Option<&Fmt> = None;
+    for n in &nodes {
         match n {
-            Node::Text(t, f) => push(&mut out, t, f, em, strong, strike),
+            Node::Text(t, f) => {
+                last_text = Some(f);
+                push(&mut out, t, f, em, strong, strike);
+            }
             Node::Inl(Inline::Text(t, f)) => push(&mut out, t, f, em, strong, strike),
             Node::Inl(other) => out.push(other.clone()),
             Node::Delim { ch, left, opens, closes, .. } => {
@@ -1041,9 +1040,11 @@ fn emit(mut nodes: Vec<Node>) -> Vec<Inline> {
                         Emph::Strike => strike = strike.saturating_sub(1),
                     }
                 }
-                let lit: String = std::iter::repeat_n(*ch, *left).collect();
-                let f = base_of(&nodes, k);
-                push(&mut out, &lit, &f, em, strong, strike);
+                if *left > 0 {
+                    let lit: String = std::iter::repeat_n(*ch, *left).collect();
+                    let f = last_text.map(|f| Fmt { bold: false, italic: false, strike: false, ..f.clone() }).unwrap_or_default();
+                    push(&mut out, &lit, &f, em, strong, strike);
+                }
                 for e in opens {
                     match e {
                         Emph::Em => em += 1,
@@ -1494,6 +1495,27 @@ mod tests {
         assert_eq!(escape_line_start("\tTabbed # text".to_string()), "   Tabbed # text");
         assert_eq!(escape_line_start("    # not a heading".to_string()), "   \\# not a heading");
         assert_eq!(escape_line_start(" \t1. not a list".to_string()), "   1\\. not a list");
+    }
+
+    #[test]
+    fn long_runs_of_delimiters_and_tags_parse_in_linear_time() {
+        // #2760: every delimiter looked back through all the ones before it for its text's
+        // formatting, and every `<a …>` lower-cased the whole rest of the paragraph: these took
+        // minutes.
+        let text = |v: &[Inline]| v.iter().filter_map(|i| if let Inline::Text(t, _) = i { Some(t.as_str()) } else { None }).collect::<String>();
+        let delims = "*_".repeat(200_000);
+        let t = text(&inl(&delims));
+        assert!(!t.is_empty() && t.len() <= delims.len() && t.chars().all(|c| c == '*' || c == '_'));
+        let tags = "<a x>".repeat(200_000);
+        assert_eq!(text(&inl(&tags)), tags);
+        // Still recognised, in any case.
+        assert!(matches!(inl("<A id=\"k\"></A>").as_slice(), [Inline::Anchor(k)] if k == "k"));
+        assert_eq!(text(&inl("a<BR/>b")), "a\nb");
+        assert!(matches!(inl("<MAILTO:me@x.y>").as_slice(), [Inline::Text(_, f)] if f.link.as_deref() == Some("MAILTO:me@x.y")));
+        // A link's formatting still reaches the delimiter literals after its text.
+        let v = inl("[a*](http://x)");
+        assert!(v.iter().all(|i| matches!(i, Inline::Text(_, f) if f.link.as_deref() == Some("http://x"))));
+        assert_eq!(text(&v), "a*");
     }
 
     #[test]
