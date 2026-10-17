@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,10 @@ const MAX_LINE: usize = 1 << 20;
 
 /// A connection that sends no authorised request in this time is closed.
 const FIRST_REQUEST: Duration = Duration::from_secs(30);
+
+/// Connections served at once; more are refused (`too many connections`) and closed. Each holds a
+/// thread, and one without the key for up to [`FIRST_REQUEST`].
+const MAX_CONNECTIONS: usize = 32;
 
 /// The key file of a running control server; [`KeyFile::remove`] it when the window closes.
 pub struct KeyFile(PathBuf);
@@ -71,7 +76,7 @@ pub fn start(port: u16, ctx: egui::Context, settings: Option<&Path>) -> Option<(
         Some(f) => log::info!("control server listening on 127.0.0.1:{port}, key in {}", f.path().display()),
         None => log::info!("control server listening on 127.0.0.1:{port}"),
     }
-    Some((serve_on(listener, ctx, key, FIRST_REQUEST), key_file))
+    Some((serve_on(listener, ctx, key, FIRST_REQUEST, MAX_CONNECTIONS), key_file))
 }
 
 /// A new key: 32 random bytes from the operating system, as hex.
@@ -103,15 +108,46 @@ fn keys_match(given: &str, key: &str) -> bool {
     !b.is_empty() && a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn serve_on(listener: TcpListener, ctx: egui::Context, key: String, first: Duration) -> Receiver<ControlRequest> {
+/// A served connection's place in the [`MAX_CONNECTIONS`] count; dropping it frees the place.
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    fn take(open: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        open.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < max).then_some(n + 1)).ok().map(|_| Self(open.clone()))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn serve_on(listener: TcpListener, ctx: egui::Context, key: String, first: Duration, max_conns: usize) -> Receiver<ControlRequest> {
     let (tx, rx) = channel::<ControlRequest>();
     let key: Arc<str> = key.into();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
+    let accept = move || {
+        let open = Arc::new(AtomicUsize::new(0));
+        for mut stream in listener.incoming().flatten() {
+            // Each connection holds a thread: refuse more than a few at once.
+            let Some(slot) = Slot::take(&open, max_conns) else {
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                let _ = writeln!(stream, "{}", json!({"ok": false, "error": "too many connections"}));
+                continue;
+            };
             let (tx, ctx, key) = (tx.clone(), ctx.clone(), key.clone());
-            std::thread::spawn(move || serve(stream, tx, ctx, &key, first));
+            let spawned = std::thread::Builder::new().name("control-conn".into()).spawn(move || {
+                let _slot = slot;
+                serve(stream, tx, ctx, &key, first);
+            });
+            if let Err(e) = spawned {
+                log::error!("control server: no thread for a connection ({e})");
+            }
         }
-    });
+    };
+    if let Err(e) = std::thread::Builder::new().name("control-accept".into()).spawn(accept) {
+        log::error!("control server off: no thread to accept connections ({e})");
+    }
     rx
 }
 
@@ -257,14 +293,56 @@ mod tests {
 
     const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    fn boot_with(first: Duration) -> (u16, Receiver<ControlRequest>) {
+    fn boot_capped(first: Duration, max_conns: usize) -> (u16, Receiver<ControlRequest>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        (port, serve_on(listener, egui::Context::default(), KEY.to_string(), first))
+        (port, serve_on(listener, egui::Context::default(), KEY.to_string(), first, max_conns))
+    }
+
+    fn boot_with(first: Duration) -> (u16, Receiver<ControlRequest>) {
+        boot_capped(first, MAX_CONNECTIONS)
     }
 
     fn boot() -> (u16, Receiver<ControlRequest>) {
         boot_with(FIRST_REQUEST)
+    }
+
+    #[test]
+    fn connections_over_the_cap_are_refused() {
+        let (port, _rx) = boot_capped(FIRST_REQUEST, 2);
+        let auth = format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#);
+        let mut a = Conn::open(port);
+        let mut b = Conn::open(port);
+        assert_eq!(a.call(&auth)["ok"], true);
+        assert_eq!(b.call(&auth)["ok"], true);
+        // A third, even without sending anything, is refused and closed.
+        let mut c = Conn::open(port);
+        assert_eq!(c.recv()["error"], "too many connections");
+        assert!(c.closed());
+        // A closed connection frees its place (once its thread sees the close).
+        drop(a);
+        let t0 = Instant::now();
+        loop {
+            let mut d = Conn::open(port);
+            if d.call(&auth)["ok"] == true {
+                break;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(5), "the place was not freed");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(b.call(&auth)["ok"], true, "the others are unaffected");
+    }
+
+    #[test]
+    fn slots_count_up_to_the_cap_and_free_on_drop() {
+        let open = Arc::new(AtomicUsize::new(0));
+        let a = Slot::take(&open, 2).unwrap();
+        let b = Slot::take(&open, 2).unwrap();
+        assert!(Slot::take(&open, 2).is_none());
+        drop(a);
+        let c = Slot::take(&open, 2).unwrap();
+        drop((b, c));
+        assert_eq!(open.load(Ordering::SeqCst), 0);
     }
 
     /// Answer the next request that reaches the UI with `ok`, and return it.
