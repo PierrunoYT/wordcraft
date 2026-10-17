@@ -111,24 +111,46 @@ pub(crate) struct Blip {
 
 /// The picture of an `OfficeArtFBSE` body: its embedded BLIP, or the BLIP stored at `foDelay`
 /// in `delay` (the WordDocument stream for the document's BLIP store, the Data stream for
-/// inline pictures). `limit` caps the bytes produced.
-pub(crate) fn fbse_blip(fbse: &[u8], delay: &[u8], limit: usize) -> Option<Blip> {
+/// inline pictures). `limit` caps the bytes produced; `work` is the document's decode-work
+/// budget (see [`blip`]).
+pub(crate) fn fbse_blip(fbse: &[u8], delay: &[u8], limit: usize, work: &mut u64) -> Option<Blip> {
     // btWin32, btMacOS, rgbUid[16], tag, size, cRef, foDelay, unused, cbName, unused×2.
     let size = u32_at(fbse, 20)? as usize;
     let fo_delay = u32_at(fbse, 28)? as usize;
     let cb_name = *fbse.get(33)? as usize;
     let at = 36usize.checked_add(cb_name)?;
     if let Some((rec, _)) = fbse.get(at..).and_then(record) {
-        return blip(&rec, limit);
+        return blip(&rec, limit, work);
     }
     // Not embedded: the record sits in the delay stream.
     let end = fo_delay.checked_add(size.max(8))?.min(delay.len());
     let (rec, _) = record(delay.get(fo_delay..end)?)?;
-    blip(&rec, limit)
+    blip(&rec, limit, work)
+}
+
+/// Where the BLIP of an `OfficeArtFBSE` that does not embed it sits in the delay stream:
+/// (`foDelay`, `size`). `None` for an embedded BLIP or a malformed FBSE.
+pub(crate) fn fbse_delay(fbse: &[u8]) -> Option<(u32, u32)> {
+    let size = u32_at(fbse, 20)?;
+    let fo_delay = u32_at(fbse, 28)?;
+    let at = 36usize.checked_add(*fbse.get(33)? as usize)?;
+    fbse.get(at..).and_then(record).is_none().then_some((fo_delay, size))
+}
+
+/// Take up to `want` from the decode-work budget: what was granted (0 once it is spent).
+fn take_work(work: &mut u64, want: u64) -> u64 {
+    let granted = want.min(*work);
+    *work -= granted;
+    granted
 }
 
 /// Decode one `OfficeArtBlip*` record ([MS-ODRAW] §2.2.23-§2.2.31).
-pub(crate) fn blip(rec: &Rec, limit: usize) -> Option<Blip> {
+///
+/// `work` is the document's decode-work budget, charged before each attempt whether or not it
+/// succeeds: a deflated metafile pays the bytes it may inflate to (a success gets back what it
+/// did not use) and a DIB its decoded size. Without it, thousands of store entries naming one
+/// zlib bomb, or a tiny RLE bitmap declaring a huge size, cost minutes of CPU for nothing.
+pub(crate) fn blip(rec: &Rec, limit: usize, work: &mut u64) -> Option<Blip> {
     // Each type has two instance values; the odd one carries a second 16-byte UID.
     let uids = if rec.inst & 1 == 1 { 32 } else { 16 };
     match rec.typ {
@@ -141,7 +163,7 @@ pub(crate) fn blip(rec: &Rec, limit: usize) -> Option<Blip> {
                 rt::BLIP_PNG => Some(Blip { bytes: data.to_vec(), ext: "png", placeholder: false }),
                 rt::BLIP_JPEG | rt::BLIP_JPEG_CMYK => Some(Blip { bytes: data.to_vec(), ext: "jpeg", placeholder: false }),
                 rt::BLIP_TIFF => Some(Blip { bytes: data.to_vec(), ext: "tiff", placeholder: false }),
-                _ => dib_to_png(data, limit),
+                _ => dib_to_png(data, limit, work),
             }
         }
         rt::BLIP_EMF | rt::BLIP_WMF | rt::BLIP_PICT => {
@@ -155,7 +177,13 @@ pub(crate) fn blip(rec: &Rec, limit: usize) -> Option<Blip> {
             let cap = limit.min(MAX_METAFILE);
             let bytes = if compression == 0 {
                 let want = if cb_size > 0 { cb_size.min(cap) } else { cap };
-                miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(raw, want).ok()?
+                let granted = usize::try_from(take_work(work, want as u64)).unwrap_or(0);
+                if granted == 0 {
+                    return None;
+                }
+                let bytes = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(raw, granted).ok()?;
+                *work = work.saturating_add(granted.saturating_sub(bytes.len()) as u64);
+                bytes
             } else {
                 if raw.len() > cap {
                     return None;
@@ -177,12 +205,22 @@ pub(crate) fn blip(rec: &Rec, limit: usize) -> Option<Blip> {
 
 /// A device-independent bitmap (BITMAPINFOHEADER + palette + pixels) as a PNG: the DIB gets
 /// the 14-byte BMP file header it lacks, is decoded with size limits and re-encoded. When the
-/// bitmap can't be decoded the BMP bytes are kept (and render as a grey placeholder).
-fn dib_to_png(dib: &[u8], limit: usize) -> Option<Blip> {
+/// bitmap can't be decoded (or the decode-work budget can't pay for its declared size) the BMP
+/// bytes are kept (and render as a grey placeholder).
+fn dib_to_png(dib: &[u8], limit: usize, work: &mut u64) -> Option<Blip> {
     let header = u32_at(dib, 0)? as usize;
     if !(12..=124).contains(&header) {
         return None;
     }
+    // The declared size, which a few bytes of RLE can make huge: decoding costs about four bytes
+    // a pixel, up to the decoder's allocation cap.
+    let (w, h) = if header == 12 {
+        (u64::from(u16_at(dib, 4)?), u64::from(u16_at(dib, 6)?))
+    } else {
+        (u64::from(i32_at(dib, 4)?.unsigned_abs()), u64::from(i32_at(dib, 8)?.unsigned_abs()))
+    };
+    let max_alloc = (256u64 << 20).min(limit as u64);
+    let cost = w.saturating_mul(h).saturating_mul(4).min(max_alloc);
     let (bits, used, compression) =
         if header == 12 { (u16_at(dib, 10)? as usize, 0, 0) } else { (u16_at(dib, 14)? as usize, u32_at(dib, 32)? as usize, u32_at(dib, 16)?) };
     let entry = if header == 12 { 3 } else { 4 };
@@ -203,12 +241,17 @@ fn dib_to_png(dib: &[u8], limit: usize) -> Option<Blip> {
     bmp.extend_from_slice(&[0, 0, 0, 0]);
     bmp.extend_from_slice(&u32::try_from(off_bits).ok()?.to_le_bytes());
     bmp.extend_from_slice(dib);
+    // Paid before decoding, whether or not the decode succeeds.
+    if *work < cost {
+        return Some(Blip { bytes: bmp, ext: "bmp", placeholder: true });
+    }
+    *work -= cost;
     let mut reader = image::ImageReader::new(std::io::Cursor::new(&bmp));
     reader.set_format(image::ImageFormat::Bmp);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DIB_SIDE);
     limits.max_image_height = Some(MAX_DIB_SIDE);
-    limits.max_alloc = Some((256 << 20).min(limit as u64));
+    limits.max_alloc = Some(max_alloc);
     reader.limits(limits);
     let mut png = PictureWriter { bytes: Vec::new(), limit };
     match reader.decode() {

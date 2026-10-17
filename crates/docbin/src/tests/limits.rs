@@ -60,7 +60,11 @@ fn style_tab_stops_are_capped_and_each_style_resolved_once() {
 #[test]
 fn style_cycles_resolve_without_looping() {
     let italic = grpprl(&[(0x0836, &[0x01])]);
-    let raw = vec![raw_style(1, "A", Vec::new(), grpprl(&[(0x0835, &[0x01])])), raw_style(0, "B", Vec::new(), italic), raw_style(2, "Self", Vec::new(), Vec::new())];
+    let raw = vec![
+        raw_style(1, "A", Vec::new(), grpprl(&[(0x0835, &[0x01])])),
+        raw_style(0, "B", Vec::new(), italic),
+        raw_style(2, "Self", Vec::new(), Vec::new()),
+    ];
     let sheet = crate::fmt::stylesheet(&raw, &[]);
     let a = sheet.styles.first().expect("A");
     assert_eq!((a.chr.bold, a.chr.italic), (Some(true), Some(true)), "A over B");
