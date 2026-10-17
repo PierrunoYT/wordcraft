@@ -5488,6 +5488,31 @@ fn dictionaries_folder_option_is_saved_searched_and_reported() {
     assert_eq!(prefs["dictionariesFolder"], json!(dir.to_string_lossy()));
 }
 
+/// Automation can't point the dictionaries folder outside its read root, nor make the app probe
+/// a network share for it (#2775). Only refusals here: a folder that is taken applies to the
+/// whole process.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn dictionaries_folder_is_held_to_the_read_root() {
+    let base = std::env::temp_dir().join(format!("wc-engine-dictionaries-root-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    for d in ["in", "outside"] {
+        std::fs::create_dir_all(base.join(d)).unwrap();
+    }
+    let roots = crate::file_access::AutomationRoots::new(Some(&base.join("in")), None).unwrap();
+    let mut s = s();
+    let outside = base.join("outside").to_string_lossy().into_owned();
+    let e = crate::file_access::confine(roots.as_ref(), || s.run("file.options", &json!({"dictionariesFolder": outside}))).unwrap_err().to_string();
+    assert!(e.contains("outside the read root"), "{e}");
+    let e = crate::file_access::confine(None, || s.run("file.options", &json!({"dictionariesFolder": r"\\192.0.2.1\share\dicts"})))
+        .unwrap_err()
+        .to_string();
+    // Refused by its spelling (on Unix it isn't a full path in the first place).
+    assert!(e.contains("network paths are not allowed") || e.contains("isn't a full path"), "{e}");
+    assert_eq!(s.prefs.dictionaries_folder, None, "a refused folder changes nothing");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Review › Language and the proofing commands work in Portuguese end to end: the language makes
 /// the document's words Portuguese, F7 and the issue list use the Portuguese dictionary and
 /// grammar, suggestions come from it, and a suggestion fixes the text.
@@ -7093,6 +7118,46 @@ fn exported_page_images_draw_headers_at_full_strength() {
     let darkest = (0..top).flat_map(|y| (0..img.width()).map(move |x| (x, y))).map(|(x, y)| img.get_pixel(x, y)[0]).min().unwrap();
     assert!(darkest < 60, "header drawn dimmed: darkest pixel {darkest}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `file.exportPng` writes only `.png` files (any case): a page image must never replace a shell
+/// profile or a document (#2745). A page number past `usize` is no such page, not page 1 (on
+/// 32-bit targets it used to wrap).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn export_png_writes_only_png_files() {
+    let mut s = s();
+    let dir = std::env::temp_dir().join(format!("wordcraft-png-ext-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in [".bashrc", "notes.docx", "page", "page.png.txt"] {
+        let path = dir.join(name);
+        let e = s.run("file.exportPng", &json!({"path": path.to_string_lossy()})).unwrap_err().to_string();
+        assert!(e.contains("must end in .png"), "{name}: {e}");
+        assert!(!path.exists(), "{name} written");
+    }
+    let upper = dir.join("PAGE.PNG");
+    s.run("file.exportPng", &json!({"path": upper.to_string_lossy(), "scale": 0.2})).unwrap();
+    assert!(std::fs::read(&upper).unwrap().starts_with(b"\x89PNG"));
+    let e = s.run("file.exportPng", &json!({"path": dir.join("far.png").to_string_lossy(), "page": u64::MAX})).unwrap_err().to_string();
+    assert!(e.contains("no page"), "{e}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A FIFO or a device given as a picture, a recipient list or a document is refused before it is
+/// opened, never read without end or waited on (audit WC-22).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn special_files_are_refused_not_read() {
+    let mut s = s();
+    let folder = std::env::temp_dir().to_string_lossy().into_owned();
+    assert!(s.run("insert.picture", &json!({"path": folder})).unwrap_err().to_string().contains("not a file"));
+    assert!(s.run("mailings.recipients", &json!({"path": folder})).is_err());
+    #[cfg(unix)]
+    for path in ["/dev/zero", "/dev/null"] {
+        assert!(s.run("insert.picture", &json!({"path": path})).unwrap_err().to_string().contains("not a file"), "{path}");
+        assert!(s.run("file.open", &json!({"path": path})).is_err(), "{path}");
+    }
 }
 
 /// Text typed right after a footnote or endnote number is plain body text, not another raised number.

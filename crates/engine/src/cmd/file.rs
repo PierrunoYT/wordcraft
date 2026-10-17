@@ -89,7 +89,7 @@ pub fn specs() -> Vec<CommandSpec> {
         .params(r#"{"path": string, "markup"?: bool (Print Markup: tracked changes marked up and each page scaled down beside the comments in balloons; default file.printMarkup)}"#)
         .pure(),
         CommandSpec::new("file.exportPng", "Export Page as PNG", "File › Export", export_png)
-            .params(r#"{"path": string, "page"?: n (1-based), "scale"?: px per pt, "markup"?: bool (the page with its comments in balloons beside it; default file.printMarkup)}"#)
+            .params(r#"{"path": string (ends in .png), "page"?: n (1-based), "scale"?: px per pt, "markup"?: bool (the page with its comments in balloons beside it; default file.printMarkup)}"#)
             .pure(),
         // A print setting, like Word's: not part of the document, so no undo step.
         CommandSpec::new("file.printMarkup", "Print Markup", "File › Print", |s, v| {
@@ -335,7 +335,12 @@ pub fn export_options(s: &Session, v: &Value) -> crate::io::ExportOptions {
 
 fn export_png(s: &mut Session, v: &Value) -> CmdResult {
     let path = p::req_str(v, "path")?;
-    let page = p::u64(v, "page").unwrap_or(1).max(1) as usize - 1;
+    // Only a PNG file, as every other save is a file of its own format: never `~/.bashrc` (#2745).
+    if !std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
+        return Err(CmdError::Params("`path` must end in .png".into()));
+    }
+    // 1-based; a page number too large for `usize` (32-bit targets) is simply no such page.
+    let page = usize::try_from(p::u64(v, "page").unwrap_or(1)).unwrap_or(usize::MAX).saturating_sub(1);
     let scale = p::f32(v, "scale").unwrap_or(2.0).clamp(0.1, 8.0);
     let l = s.export_layout_with(export_options(s, v).markup);
     let pg = l.pages.get(page).ok_or_else(|| CmdError::Params(format!("no page {}", page + 1)))?;
