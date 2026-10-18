@@ -102,6 +102,27 @@ fn deep_nesting_is_rejected() {
 }
 
 #[test]
+fn entry_names_that_are_not_utf8_do_not_stop_the_package() {
+    // zip ≥ 9 decodes entry names on demand (UTF-8, else CP437) and may report an error; an odd
+    // name must cost that part at most, never the document.
+    let doc = format!("<w:document {W_NS}><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p></w:body></w:document>");
+    let mut z = zip(&[("_rels/.rels", ROOT_RELS.as_bytes()), ("word/document.xml", doc.as_bytes()), ("custom/@@.bin", b"x")]);
+    // Both the local header and the central directory spell the name: make it invalid UTF-8.
+    let mut patched = 0;
+    for i in 0..z.len().saturating_sub(13) {
+        if &z[i..i + 13] == b"custom/@@.bin" {
+            z[i + 7] = 0xff;
+            z[i + 8] = 0x82;
+            patched += 1;
+        }
+    }
+    assert_eq!(patched, 2);
+    let d = read(&z).unwrap();
+    assert_eq!(d.plain_text(wordcraft_doc::StoryRef::Body), "body");
+    write(&d).unwrap();
+}
+
+#[test]
 fn broken_secondary_parts_are_ignored() {
     let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="a" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="b" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/><Relationship Id="c" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/></Relationships>"#;
     let doc = format!("<w:document {W_NS}><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p></w:body></w:document>");

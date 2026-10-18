@@ -182,7 +182,10 @@ impl Package {
             if f.is_dir() {
                 continue;
             }
-            let name = f.name().trim_start_matches('/').to_string();
+            let name = match f.name() {
+                Ok(n) => n.trim_start_matches('/').to_string(),
+                Err(_) => String::from_utf8_lossy(f.name_raw()).trim_start_matches('/').to_string(),
+            };
             if f.size() > max_part {
                 return Err(DocxError::Limit(format!("part {name} declares {} bytes", f.size())));
             }
