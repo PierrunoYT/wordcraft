@@ -10,8 +10,9 @@
 //! hasn't been damaged or tampered with.
 //!
 //! Files are hostile: every stream read is capped, every length is checked before slicing, and the
-//! spin count is bounded by the specification's maximum. Passwords and keys are wiped from memory
-//! when dropped ([`Zeroizing`]) and never logged.
+//! spin count of an encrypted package is bounded ([`MAX_DECRYPT_SPIN_COUNT`]). A package without
+//! `dataIntegrity` still opens, as in Word, but tampering with it can't be detected (logged).
+//! Passwords and keys are wiped from memory when dropped ([`Zeroizing`]) and never logged.
 
 use std::io::{Cursor, Read, Write};
 
@@ -27,8 +28,13 @@ use crate::xml;
 /// The spin count Word uses, and WordCraft writes.
 pub const DEFAULT_SPIN_COUNT: u32 = 100_000;
 /// The largest spin count the specification allows (§2.3.4.10 `ST_SpinCount`): it bounds the
-/// work a hostile file can ask for.
+/// work a document-protection password hash can ask for (Word accepts up to it there).
 const MAX_SPIN_COUNT: u32 = 10_000_000;
+/// The largest spin count an encrypted package may ask for, and the most WordCraft writes. Each
+/// password attempt hashes this many times, so the specification's 10,000,000 SHA-512 rounds
+/// would cost seconds per try; Word, Excel and other producers write 100,000, so ten times that
+/// keeps real files opening.
+const MAX_DECRYPT_SPIN_COUNT: u32 = 1_000_000;
 /// Word's limit on password length, in characters.
 pub const MAX_PASSWORD_CHARS: usize = 255;
 /// `EncryptedPackage` is encrypted in segments of this many bytes (§2.3.4.15).
@@ -92,7 +98,11 @@ pub fn decrypt(bytes: &[u8], password: Option<&str>) -> Result<Vec<u8>, DocxErro
     let key_key = derive_key(pe.hash, &hn, &BK_KEY_VALUE, pe.key_bytes);
     let key = Zeroizing::new(cbc_decrypt(&key_key, &iv, &pe.key_value)?);
     let key = Zeroizing::new(key.get(..info.key_bytes).ok_or_else(|| bad("the encrypted key is too short"))?.to_vec());
-    // Data integrity (§2.3.4.14): an HMAC of the whole EncryptedPackage stream.
+    // Data integrity (§2.3.4.14): an HMAC of the whole EncryptedPackage stream. It is optional;
+    // without it the file still opens, as in Word, but a damaged or altered package goes unnoticed.
+    if info.integrity.is_none() {
+        log::warn!("docx: the encrypted package has no dataIntegrity HMAC; it can't be checked for tampering");
+    }
     if let Some((enc_key, enc_value)) = &info.integrity {
         let hmac_key = Zeroizing::new(cbc_decrypt(&key, &make_iv(info.hash, &info.salt, Some(&BK_HMAC_KEY), info.block_size), enc_key)?);
         // The key is the salt, zero-padded to the block size; HMAC pads short keys with zeros
@@ -133,7 +143,7 @@ pub fn encrypt(package: &[u8], password: &str) -> Result<Vec<u8>, DocxError> {
 /// [`encrypt`] with a chosen spin count (tests use a small one; files should use the default).
 pub fn encrypt_with_spin_count(package: &[u8], password: &str, spin_count: u32) -> Result<Vec<u8>, DocxError> {
     check_password(password)?;
-    let spin_count = spin_count.min(MAX_SPIN_COUNT);
+    let spin_count = spin_count.min(MAX_DECRYPT_SPIN_COUNT);
     let hash = Hash::Sha512;
     let key_bytes = 32;
     let key_data_salt = random(SALT)?;
@@ -482,7 +492,7 @@ impl Hash {
 fn iterate(hash: Hash, salt: &[u8], password: &str, spin_count: u32) -> Zeroizing<Vec<u8>> {
     let pw: Zeroizing<Vec<u8>> = Zeroizing::new(password.encode_utf16().flat_map(u16::to_le_bytes).collect());
     let mut h = Zeroizing::new(hash.hash(&[salt, &pw]));
-    for i in 0..spin_count.min(MAX_SPIN_COUNT) {
+    for i in 0..spin_count.min(MAX_DECRYPT_SPIN_COUNT) {
         *h = hash.hash(&[&i.to_le_bytes(), &h]);
     }
     h
@@ -667,7 +677,7 @@ fn parse_info(info: &[u8]) -> Result<Info, DocxError> {
         .ok_or_else(|| bad("this file isn't protected with a password (only certificate encryption is listed)"))?;
     let pe = params(ek)?;
     let spin_count: u32 = ek.attr("spinCount").and_then(|s| s.trim().parse().ok()).ok_or_else(|| bad("bad spinCount"))?;
-    if spin_count > MAX_SPIN_COUNT {
+    if spin_count > MAX_DECRYPT_SPIN_COUNT {
         return Err(bad(format!("spinCount {spin_count} is over the allowed maximum")));
     }
     Ok(Info {
@@ -918,6 +928,33 @@ mod tests {
         comp.create_stream("/EncryptedPackage").unwrap().write_all(package).unwrap();
         comp.flush().unwrap();
         comp.into_inner().into_inner()
+    }
+
+    /// Audit minor: a package could ask for the specification's 10,000,000 SHA-512 rounds per
+    /// password attempt. Word's 100,000 (and up to ten times that) is still accepted; more is
+    /// refused before any hashing, and WordCraft never writes more.
+    #[test]
+    fn spin_counts_past_the_decrypt_bound_are_refused() {
+        let good = encrypt_with_spin_count(&zip_package(), "pw", 2).unwrap();
+        let mut comp = cfb::CompoundFile::open(Cursor::new(&good)).unwrap();
+        let mut info = Vec::new();
+        comp.open_stream("/EncryptionInfo").unwrap().read_to_end(&mut info).unwrap();
+        let xml = String::from_utf8(info[8..].to_vec()).unwrap();
+        let with_spin = |n: u32| {
+            let mut v = info[..8].to_vec();
+            v.extend_from_slice(xml.replacen("spinCount=\"2\"", &format!("spinCount=\"{n}\""), 1).as_bytes());
+            v
+        };
+        for n in [DEFAULT_SPIN_COUNT, MAX_DECRYPT_SPIN_COUNT] {
+            assert_eq!(parse_info(&with_spin(n)).map(|i| i.password.spin_count).ok(), Some(n));
+        }
+        for n in [MAX_DECRYPT_SPIN_COUNT + 1, MAX_SPIN_COUNT] {
+            assert!(matches!(parse_info(&with_spin(n)), Err(DocxError::Encryption(m)) if m.contains("spinCount")));
+        }
+        let mut comp = cfb::CompoundFile::open(Cursor::new(encrypt_with_spin_count(&zip_package(), "pw", u32::MAX).unwrap())).unwrap();
+        let mut info = Vec::new();
+        comp.open_stream("/EncryptionInfo").unwrap().read_to_end(&mut info).unwrap();
+        assert_eq!(parse_info(&info).map(|i| i.password.spin_count).ok(), Some(MAX_DECRYPT_SPIN_COUNT));
     }
 
     #[test]

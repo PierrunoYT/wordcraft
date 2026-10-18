@@ -56,10 +56,21 @@ struct Conv {
     stories: Vec<(String, El)>,
     next_note: i64,
     story_count: usize,
+    /// Size limits of one part and of all of them ([`MAX_PART`], [`MAX_TOTAL`]), as when a zip
+    /// package is opened, and the bytes stored so far.
+    max_part: u64,
+    max_total: u64,
+    total: u64,
 }
 
 /// Rewrite a Word 2003 XML Document as a WordprocessingML package.
 pub(crate) fn convert(bytes: &[u8]) -> Result<Package, DocxError> {
+    convert_limited(bytes, MAX_PART, MAX_TOTAL)
+}
+
+/// [`convert`] with the part and package size limits a zip package gets
+/// ([`Package::open_limited`]): every part written, pictures included, counts against them.
+fn convert_limited(bytes: &[u8], max_part: u64, max_total: u64) -> Result<Package, DocxError> {
     let root = xml::parse_ns(bytes, &[("w", W2003_NS), ("wx", AUX_NS), ("aml", AML_NS)])?;
     if root.name != "w:wordDocument" {
         return Err(DocxError::NotWord(format!("root element is {}", root.name)));
@@ -74,9 +85,11 @@ pub(crate) fn convert(bytes: &[u8]) -> Result<Package, DocxError> {
         stories: Vec::new(),
         next_note: 1,
         story_count: 0,
+        max_part,
+        max_total,
+        total: 0,
     };
-    let mut total = 0u64;
-    c.collect_media(&root, 0, &mut total)?;
+    c.collect_media(&root, 0)?;
 
     // Body: `wx:sect` / `wx:sub-section` wrappers unwrapped; the last section's properties last.
     let mut body = El { name: "w:body".into(), ..El::default() };
@@ -95,11 +108,11 @@ pub(crate) fn convert(bytes: &[u8]) -> Result<Package, DocxError> {
     let mut overrides: Vec<(String, &str)> = Vec::new();
     let wml = |s: &str| format!("application/vnd.openxmlformats-officedocument.wordprocessingml.{s}+xml");
     let styles = c.styles(&root);
-    c.put("word/styles.xml", &styles);
+    c.put("word/styles.xml", &styles)?;
     c.rels[DOC].add(rt::STYLES, "styles.xml", false);
     overrides.push(("/word/styles.xml".into(), "styles"));
     if let Some(n) = root.child("w:lists").map(|l| c.numbering(l)) {
-        c.put("word/numbering.xml", &n);
+        c.put("word/numbering.xml", &n)?;
         c.rels[DOC].add(rt::NUMBERING, "numbering.xml", false);
         overrides.push(("/word/numbering.xml".into(), "numbering"));
     }
@@ -112,26 +125,26 @@ pub(crate) fn convert(bytes: &[u8]) -> Result<Package, DocxError> {
             continue;
         }
         let file = format!("{ct}.xml");
-        c.put(&format!("word/{file}"), &El { name: root_name.into(), attrs: xml::body_ns(), kids });
-        c.put_rels(&file, part);
+        c.put(&format!("word/{file}"), &El { name: root_name.into(), attrs: xml::body_ns(), kids })?;
+        c.put_rels(&file, part)?;
         c.rels[DOC].add(rel, &file, false);
         overrides.push((format!("/word/{file}"), ct));
     }
     for (i, (file, story)) in std::mem::take(&mut c.stories).into_iter().enumerate() {
-        c.put(&format!("word/{file}"), &story);
-        c.put_rels(&file, i + 4);
+        c.put(&format!("word/{file}"), &story)?;
+        c.put_rels(&file, i + 4)?;
         overrides.push((format!("/word/{file}"), if story.name == "w:ftr" { "footer" } else { "header" }));
     }
-    c.put("word/document.xml", &document);
-    c.put_rels("document.xml", DOC);
+    c.put("word/document.xml", &document)?;
+    c.put_rels("document.xml", DOC)?;
 
     let mut root_rels = PartRels::default();
     root_rels.add(rt::OFFICE_DOC, "word/document.xml", false);
     if let Some(props) = root.child("o:DocumentProperties") {
-        c.files.insert("docProps/core.xml".into(), core_xml(props));
+        c.store("docProps/core.xml".into(), core_xml(props))?;
         root_rels.add(rt::CORE, "docProps/core.xml", false);
     }
-    c.files.insert("_rels/.rels".into(), root_rels.xml());
+    c.store("_rels/.rels".into(), root_rels.xml())?;
 
     let mut w = W::new();
     w.open("Types", &[("xmlns", "http://schemas.openxmlformats.org/package/2006/content-types")]);
@@ -151,28 +164,43 @@ pub(crate) fn convert(bytes: &[u8]) -> Result<Package, DocxError> {
         w.empty("Override", &[("PartName", "/docProps/core.xml"), ("ContentType", "application/vnd.openxmlformats-package.core-properties+xml")]);
     }
     w.close("Types");
-    c.files.insert("[Content_Types].xml".into(), w.into_bytes());
+    c.store("[Content_Types].xml".into(), w.into_bytes())?;
     Ok(Package::from_parts(c.files))
 }
 
 impl Conv {
+    /// Store a part, within the size limits.
+    fn store(&mut self, path: String, bytes: Vec<u8>) -> Result<(), DocxError> {
+        let len = bytes.len() as u64;
+        if len > self.max_part {
+            return Err(DocxError::Limit(format!("part {path} is larger than the size limit")));
+        }
+        self.total = self.total.saturating_add(len);
+        if self.total > self.max_total {
+            return Err(DocxError::Limit("the converted document is larger than the size limit".into()));
+        }
+        self.files.insert(path, bytes);
+        Ok(())
+    }
+
     /// Store an element as a part.
-    fn put(&mut self, path: &str, root: &El) {
+    fn put(&mut self, path: &str, root: &El) -> Result<(), DocxError> {
         let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
         s.push_str(&root.to_xml());
-        self.files.insert(path.into(), s.into_bytes());
+        self.store(path.into(), s.into_bytes())
     }
 
     /// Store the relationships of `word/{file}` (if it has any).
-    fn put_rels(&mut self, file: &str, part: usize) {
+    fn put_rels(&mut self, file: &str, part: usize) -> Result<(), DocxError> {
         if let Some(r) = self.rels.get(part).filter(|r| !r.is_empty()) {
             let x = r.xml();
-            self.files.insert(format!("word/_rels/{file}.rels"), x);
+            self.store(format!("word/_rels/{file}.rels"), x)?;
         }
+        Ok(())
     }
 
     /// Every `w:binData` in the file, decoded into a media part.
-    fn collect_media(&mut self, e: &El, depth: usize, total: &mut u64) -> Result<(), DocxError> {
+    fn collect_media(&mut self, e: &El, depth: usize) -> Result<(), DocxError> {
         if depth > MAX_DEPTH {
             return Ok(());
         }
@@ -184,23 +212,22 @@ impl Conv {
                 }
                 let text = k.text();
                 let b64: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-                if (b64.len() / 4 * 3) as u64 > MAX_PART {
+                if (b64.len() / 4 * 3) as u64 > self.max_part {
                     return Err(DocxError::Limit(format!("picture {name} is larger than the size limit")));
                 }
                 let Ok(bytes) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(b64.trim_end_matches('=')) else {
                     log::warn!("wordml2003: skipping picture {name}: invalid base64");
                     continue;
                 };
-                *total = total.saturating_add(bytes.len() as u64);
-                if *total > MAX_TOTAL {
+                if self.total.saturating_add(bytes.len() as u64) > self.max_total {
                     return Err(DocxError::Limit("pictures larger than the size limit".into()));
                 }
                 let ext = picture_ext(&bytes, name);
                 let target = format!("media/image{}.{ext}", self.media.len() + 1);
-                self.files.insert(format!("word/{target}"), bytes);
+                self.store(format!("word/{target}"), bytes)?;
                 self.media.insert(name.to_string(), target);
             } else {
-                self.collect_media(k, depth + 1, total)?;
+                self.collect_media(k, depth + 1)?;
             }
         }
         Ok(())
@@ -573,4 +600,29 @@ fn core_xml(props: &El) -> Vec<u8> {
     }
     w.close("cp:coreProperties");
     w.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc_with(paras: usize) -> Vec<u8> {
+        let body = "<w:p><w:r><w:t>Some words in a paragraph.</w:t></w:r></w:p>".repeat(paras);
+        format!(r#"<w:wordDocument xmlns:w="http://schemas.microsoft.com/office/word/2003/wordml"><w:body>{body}</w:body></w:wordDocument>"#)
+            .into_bytes()
+    }
+
+    /// The converted parts are held to the zip package's limits (audit minor: the WordML 2003
+    /// conversion skipped `MAX_PART`), so a conversion can't build parts a zip couldn't hold.
+    #[test]
+    fn converted_parts_obey_the_package_limits() {
+        let xml = doc_with(2000);
+        let pkg = convert_limited(&xml, MAX_PART, MAX_TOTAL).unwrap();
+        let doc_len = pkg.get("word/document.xml").map_or(0, <[u8]>::len) as u64;
+        assert!(doc_len > 50_000, "document part is {doc_len} bytes");
+        assert!(matches!(convert_limited(&xml, doc_len - 1, MAX_TOTAL), Err(DocxError::Limit(_))));
+        assert!(matches!(convert_limited(&xml, MAX_PART, doc_len), Err(DocxError::Limit(_))));
+        assert!(convert_limited(&xml, doc_len, doc_len * 2).is_ok());
+        assert!(convert(&doc_with(1)).is_ok());
+    }
 }

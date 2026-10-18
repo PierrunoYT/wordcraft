@@ -290,6 +290,25 @@ fn table_look_bitmask_and_legacy_merges() {
     assert!(!l.header_row && l.total_row && l.first_column && !l.last_column && !l.banded_rows && l.banded_columns);
 }
 
+/// Comments whose ids aren't numbers, or collide, each get a free id (audit minor: finding one
+/// rescanned every comment read so far, quadratic in the comment count).
+#[test]
+fn comments_without_numeric_ids_get_distinct_ids() {
+    let mut list: String = ["0", "x", "1", "1"]
+        .iter()
+        .map(|id| format!(r#"<w:comment w:id="{id}" w:author="A"><w:p><w:r><w:t>c</w:t></w:r></w:p></w:comment>"#))
+        .collect();
+    for i in 0..5000 {
+        list.push_str(&format!(r#"<w:comment w:id="n{i}" w:author="A"><w:p><w:r><w:t>c</w:t></w:r></w:p></w:comment>"#));
+    }
+    let comments = format!(r#"<w:comments {W_NS}>{list}</w:comments>"#);
+    let d = wordcraft_docx::read(&docx("<w:p/>", &[("rId6", "comments", "comments.xml")], &[("word/comments.xml", &comments)])).unwrap();
+    // "1" repeated is the same comment once; every other one is kept under its own id.
+    assert_eq!(d.comments.len(), 3 + 5000);
+    assert_eq!(d.comments.keys().take(3).copied().collect::<Vec<_>>(), [0, 1, 2]);
+    assert_eq!(d.comments.keys().last().copied(), Some(5002));
+}
+
 #[test]
 fn styles_numbering_settings_notes_comments_from_parts() {
     let styles = format!(

@@ -183,6 +183,10 @@ impl Package {
                 continue;
             }
             let name = f.name().trim_start_matches('/').to_string();
+            if !part_name_ok(&name) {
+                log::warn!("docx: skipping zip entry {i}: its name isn't a safe part name");
+                continue;
+            }
             if f.size() > max_part {
                 return Err(DocxError::Limit(format!("part {name} declares {} bytes", f.size())));
             }
@@ -204,8 +208,10 @@ impl Package {
     }
 
     /// A package from parts already in memory (a Flat OPC file, a converted document), by part
-    /// name without the leading `/`.
-    pub fn from_parts(files: BTreeMap<String, Vec<u8>>) -> Package {
+    /// name without the leading `/`. Names that aren't safe part names ([`part_name_ok`]) are
+    /// dropped.
+    pub fn from_parts(mut files: BTreeMap<String, Vec<u8>>) -> Package {
+        files.retain(|name, _| part_name_ok(name));
         Package { files }
     }
 
@@ -347,12 +353,33 @@ pub fn relative(from: &str, to: &str) -> String {
     if s.split('/').next().is_some_and(|seg| seg.contains(':')) { format!("./{s}") } else { s }
 }
 
-/// Build a zip from (name, bytes) entries.
+/// Is `name` (a package path without the leading `/`) safe to keep, and to write back as a zip
+/// entry? OPC part names (ECMA-376 Part 2 §6.2.2) are `/`-separated non-empty segments; refused
+/// here are the forms another zip extractor could resolve outside its target folder: empty
+/// segments (`a//b`, a trailing `/`), dot-only segments (`.`, `..`, and `.. `, which Windows
+/// trims to `..`), backslashes (`..\..\x` is one OPC segment but a path to Windows tools), a
+/// drive in the first segment (`C:`), and control characters.
+pub fn part_name_ok(name: &str) -> bool {
+    if name.is_empty() || name.contains('\\') || name.chars().any(char::is_control) {
+        return false;
+    }
+    if name.split('/').next().is_some_and(|first| first.contains(':')) {
+        return false;
+    }
+    name.split('/').all(|seg| !seg.trim_end_matches(['.', ' ']).is_empty())
+}
+
+/// Build a zip from (name, bytes) entries. Names that aren't safe part names
+/// ([`part_name_ok`]) are left out: a save never writes a path that escapes the package.
 pub fn zip_entries(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, DocxError> {
     let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).compression_level(Some(6));
     let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for (name, bytes) in entries {
+        if !part_name_ok(name) {
+            log::warn!("docx: not writing a part whose name isn't a safe part name");
+            continue;
+        }
         // Already-compressed media gain nothing from deflate.
         let lower = name.to_ascii_lowercase();
         let o = if [".png", ".jpg", ".jpeg", ".gif", ".webp"].iter().any(|e| lower.ends_with(e)) { stored } else { opts };
@@ -398,6 +425,45 @@ mod tests {
             Err(_) => {}
             Ok(p) => assert!(p.get("a.xml").is_none_or(|b| b.len() < 1024)),
         }
+    }
+
+    #[test]
+    fn unsafe_part_names_are_dropped_on_read_and_never_written() {
+        for bad in
+            ["..\\..\\x", "word/..\\..\\evil.xml", "../x", "word/../../x", "a//b", "word/", "./a", "word/.. /x", "C:/x", "c:x", "a\u{0}b", "a\nb", ""]
+        {
+            assert!(!part_name_ok(bad), "{bad:?} accepted");
+        }
+        for good in [
+            "[Content_Types].xml",
+            "_rels/.rels",
+            "word/document.xml",
+            "word/_rels/document.xml.rels",
+            "word/a:b.bin",
+            "word/media/image 1.png",
+            "a..b/c",
+        ] {
+            assert!(part_name_ok(good), "{good:?} refused");
+        }
+        // A zip with hostile entry names opens without them, and a save can't write them back.
+        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for name in ["word/document.xml", "..\\..\\evil.txt", "word/../../evil.txt", "a//b.xml"] {
+            zw.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zw.write_all(b"<a/>").unwrap();
+        }
+        let z = zw.finish().unwrap().into_inner();
+        let pkg = Package::open(&z).unwrap();
+        assert_eq!(pkg.files.keys().map(String::as_str).collect::<Vec<_>>(), ["word/document.xml"]);
+        let flat = Package::from_parts(BTreeMap::from([("word/document.xml".to_string(), Vec::new()), ("..\\x".to_string(), Vec::new())]));
+        assert_eq!(flat.files.len(), 1);
+        let out = zip_entries(&[
+            ("word/document.xml".into(), b"<a/>".to_vec()),
+            ("..\\..\\evil.txt".into(), b"x".to_vec()),
+            ("../evil.txt".into(), b"x".to_vec()),
+        ])
+        .unwrap();
+        let back = zip::ZipArchive::new(Cursor::new(out)).unwrap();
+        assert_eq!(back.file_names().collect::<Vec<_>>(), ["word/document.xml"]);
     }
 
     #[test]
