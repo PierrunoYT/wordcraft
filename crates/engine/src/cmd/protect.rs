@@ -189,9 +189,60 @@ fn remove_exceptions(s: &mut Session, all: bool) -> Result<(), CmdError> {
     Ok(())
 }
 
-/// Commands always allowed in a protected document: protection itself, file commands, undo.
+/// The `file.*` commands a protected document still runs: they open, save, export, print, close
+/// or replace it, read it, or change the session rather than the document. Word's Restrict
+/// Editing, even "No changes (Read only)", still allows Save As, export and print.
+/// `file.protect` is `review.restrict` under File › Info, and that command guards it. Every
+/// `file.*` command is in this list or in [`FILE_EDITS`] (a test checks this). A file command in
+/// neither list is treated like any other edit.
+const FILE_ALLOWED: &[&str] = &[
+    "file.accessibility",
+    "file.autosave",
+    "file.close",
+    "file.compatibility",
+    "file.encrypt",
+    "file.exportPdf",
+    "file.exportPng",
+    "file.info",
+    "file.new",
+    "file.newFromTemplate",
+    "file.open",
+    "file.options",
+    "file.print",
+    "file.printMarkup",
+    "file.printPdf",
+    "file.privacy",
+    "file.protect",
+    "file.recover",
+    "file.rename",
+    "file.save",
+    "file.saveAs",
+    "file.saveTemplate",
+    "file.setAuthor",
+    "file.share",
+    "file.versions",
+];
+
+/// The `file.*` commands that change the document itself. Under protection they are refused when
+/// their params ask for a change (see [`file_edit_requested`]); Word likewise blocks property
+/// edits and the Document Inspector's Remove until Stop Protection. Reading still works.
+const FILE_EDITS: &[&str] = &["file.inspect", "file.privacyOptions", "file.properties"];
+
+/// Does `params` ask file command `id` (one of [`FILE_EDITS`]) to change the document?
+fn file_edit_requested(id: &str, params: &Value) -> bool {
+    match id {
+        // Without `remove` it only reports what it found.
+        "file.inspect" => params.get("remove").and_then(Value::as_array).is_some_and(|a| !a.is_empty()),
+        // Without a property it returns them.
+        "file.properties" => ["title", "subject", "author", "keywords", "comments", "category", "custom"].iter().any(|k| params.get(*k).is_some()),
+        _ => true,
+    }
+}
+
+/// Commands always allowed in a protected document: protection itself, the file commands that
+/// leave the document as it is, undo.
 fn always_allowed(id: &str) -> bool {
-    id == "review.restrict" || id.starts_with("file.") || id == "edit.undo" || id == "edit.redo"
+    id == "review.restrict" || FILE_ALLOWED.contains(&id) || id == "edit.undo" || id == "edit.redo"
 }
 
 /// What a protected document lets command `id` do before it runs: `Err` refuses it; `Ok(true)`
@@ -201,6 +252,21 @@ pub(crate) fn check_before(s: &Session, id: &str, params: &Value) -> Result<bool
     let Some(mode) = s.doc.settings.protection.as_deref() else { return Ok(false) };
     if always_allowed(id) {
         return Ok(false);
+    }
+    // These change what the protection is meant to keep (comments, revisions, properties, hidden
+    // text, headers), and none of the exceptions covers them, so they are refused in every mode,
+    // tracked changes included.
+    if FILE_EDITS.contains(&id) {
+        return if mode != "none" && file_edit_requested(id, params) {
+            let what = match id {
+                "file.inspect" => "removing content with Inspect Document",
+                "file.privacyOptions" => "changing the document's privacy options",
+                _ => "changing the document's properties",
+            };
+            Err(CmdError::Disabled(format!("{id}: stop protection before {what}")))
+        } else {
+            Ok(false)
+        };
     }
     // Word blocks content-control property edits until Stop Protection: changing a control's
     // lock flags would reshape what forms mode lets through. The param's presence is the
@@ -797,5 +863,70 @@ mod tests {
         let e = s.run("review.restrict", &json!({"stop": true, "password": "anything"})).unwrap_err();
         assert!(e.to_string().contains(super::UNSUPPORTED_PASSWORD));
         assert!(super::enforced(&s.doc));
+    }
+
+    /// WC-36: every `file.*` command is classified, either allowed under protection or a document
+    /// edit, so a new one can't slip through as a "file command". The edits are refused in every
+    /// mode when they ask for a change.
+    #[test]
+    fn every_file_command_is_allowed_or_blocked_under_protection() {
+        let s = Session::new(Document::from_text("x"));
+        let ids: Vec<&str> = s.registry.all().iter().map(|c| c.id).filter(|id| id.starts_with("file.")).collect();
+        let unclassified: Vec<&&str> = ids.iter().filter(|id| FILE_ALLOWED.contains(id) == FILE_EDITS.contains(id)).collect();
+        assert!(unclassified.is_empty(), "add each to FILE_ALLOWED or FILE_EDITS (or fix a duplicate): {unclassified:?}");
+        for id in FILE_ALLOWED.iter().chain(FILE_EDITS) {
+            assert!(ids.contains(id), "{id} is listed but isn't a command");
+        }
+        for mode in ["readOnly", "comments", "trackedChanges", "forms"] {
+            let mut s = Session::new(Document::from_text("x"));
+            s.run("review.restrict", &json!({"mode": mode})).unwrap();
+            for id in FILE_ALLOWED {
+                assert!(matches!(check_before(&s, id, &json!({})), Ok(false)), "{mode}: {id} is allowed");
+            }
+            for (id, change) in [
+                ("file.inspect", json!({"remove": ["comments"]})),
+                ("file.properties", json!({"title": "New"})),
+                ("file.properties", json!({"custom": {"Status": "final"}})),
+                ("file.privacyOptions", json!({"removePersonalInfo": true})),
+            ] {
+                assert!(matches!(check_before(&s, id, &change), Err(CmdError::Disabled(_))), "{mode}: {id} {change} is refused");
+            }
+            // Reading is still fine.
+            for id in ["file.inspect", "file.properties"] {
+                assert!(matches!(check_before(&s, id, &json!({})), Ok(false)), "{mode}: {id} reads");
+            }
+        }
+    }
+
+    /// WC-36: Inspect Document can't strip comments or revisions, and Properties can't be edited,
+    /// in a protected document; both work again after Stop Protection.
+    #[test]
+    fn file_inspect_and_properties_cannot_change_a_protected_document() {
+        let mut s = Session::new(Document::from_text("Keep this note."));
+        select(&mut s, "note");
+        s.run("review.newComment", &json!({"text": "reviewer remark"})).unwrap();
+        s.run("file.properties", &json!({"title": "Original"})).unwrap();
+        s.run("review.restrict", &json!({"mode": "comments", "password": "pw"})).unwrap();
+        let e = s.run("file.inspect", &json!({"remove": ["comments", "revisions", "properties", "hidden", "headers"]})).unwrap_err();
+        assert!(e.to_string().contains("stop protection"), "{e}");
+        assert_eq!(s.doc.comments.len(), 1, "the comment is still there");
+        assert!(s.run("file.properties", &json!({"title": "Changed"})).is_err());
+        assert!(s.run("file.properties", &json!({"custom": {"Status": "final"}})).is_err());
+        assert!(s.run("file.privacyOptions", &json!({"removePersonalInfo": true})).is_err());
+        assert_eq!(s.doc.core.title, "Original");
+        assert_eq!(s.doc.custom_prop("Status"), None);
+        assert!(!s.doc.settings.remove_personal_info);
+        // Reading, and the file commands that leave the document alone, still run.
+        assert_eq!(s.run("file.inspect", &json!({})).unwrap()["found"]["comments"], 1);
+        assert_eq!(s.run("file.properties", &json!({})).unwrap()["title"], "Original");
+        assert!(s.run("file.info", &json!({})).is_ok());
+        let bytes = crate::io::save_bytes("p.docx", &s.doc).unwrap();
+        assert_eq!(crate::io::open_bytes("p.docx", &bytes).unwrap().comments.len(), 1);
+        // After Stop Protection they work.
+        s.run("review.restrict", &json!({"stop": true, "password": "pw"})).unwrap();
+        s.run("file.inspect", &json!({"remove": ["comments"]})).unwrap();
+        assert!(s.doc.comments.is_empty());
+        s.run("file.properties", &json!({"title": "Changed"})).unwrap();
+        assert_eq!(s.doc.core.title, "Changed");
     }
 }
