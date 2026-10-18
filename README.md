@@ -195,7 +195,8 @@ covers every target starting with it (`wordcraft*=debug`). The logger is
 | apps | `wordcraft`, `wordcraft-cli`, `wordcraft-web` | desktop, command line, browser |
 
 `cargo xtask ci` runs formatting, clippy, ~800 tests, the asset-attribution check, the layering
-check and the wasm build. Contributor and agent instructions: [AGENTS.md](AGENTS.md).
+check, the wasm build and `cargo deny check` ([deny.toml](deny.toml); skipped when cargo-deny is not
+installed). Contributor and agent instructions: [AGENTS.md](AGENTS.md).
 
 ## Roadmap
 

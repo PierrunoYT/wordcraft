@@ -1,6 +1,6 @@
 # WordCraft architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (`proof` is per language: English and Polish; previously major: first committed version; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** minor (`cargo xtask deny` and `deny.toml` supply-chain policy; previously minor: `proof` is per language: English and Polish; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
 
 How WordCraft is built today (origin/main `40c5d51`). The longer design notes in
 `plan/architecture.md` are gitignored and local to the original author's machine; this file is the
@@ -54,7 +54,14 @@ winit or rfd.
   input, `.doc`, formats, typing parity (`engine/src/tests_typing.rs`), bidi, i18n catalogs, UI
   interaction (egui_kittest), MCP acceptance; `hostile_params_never_panic` runs every command with
   junk params.
-- `cargo xtask ci`: fmt, clippy `-D warnings`, tests, asset attribution, layering, wasm build.
+- `cargo xtask ci`: fmt, clippy `-D warnings`, tests, asset attribution, layering, wasm build,
+  and `cargo xtask deny`.
+- `cargo xtask deny` runs `cargo deny check` against [`deny.toml`](../deny.toml): licence
+  allow-list, RustSec advisories (each ignore carries its reason), allowed sources (crates.io and
+  storytold/craft-libs only) and duplicate-version warnings. Without cargo-deny installed it prints
+  a skip notice and passes (`cargo install cargo-deny --locked`).
+- Release builds keep integer overflow checks on in the file parsers (`docbin`, `metafile`,
+  `docx`, `formats`).
 - `cargo xtask parity` regenerates [`parity-checklist.md`](parity-checklist.md); a test keeps the
   catalog percentage above a floor that only rises.
 - GitHub Actions on PRs: packaging lint, and FreeBSD / Windows ARM64 when build files change;
@@ -64,5 +71,6 @@ winit or rfd.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-18 | minor | Supply-chain gate: `deny.toml`, `cargo xtask deny` in `cargo xtask ci`; release overflow checks for the parser crates; `zip` 9 (audit WC-40) |
 | 2026-10-10 | minor | `proof`: proofing languages (English, Polish), affix engine, Polish patterns; layout and engine route each run by its language |
 | 2026-10-10 | major | First committed architecture doc, from the crates' sources and `AGENTS.md` |

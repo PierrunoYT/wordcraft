@@ -21,7 +21,10 @@ commands:
   assets          check that every icon/image/font/asset is attributed in ATTRIBUTION.md
   layers          enforce the crate dependency layering (plan/architecture.md §3)
   wasm            cargo check --target wasm32-unknown-unknown for the wasm-safe crates
-  ci              fmt --check, clippy -D warnings, test, assets, layers, wasm (stops at first failure)
+  deny            cargo deny check (licences, advisories, sources, bans; deny.toml); skipped with a
+                  notice when cargo-deny is not installed (cargo install cargo-deny --locked)
+  ci              fmt --check, clippy -D warnings, test, assets, layers, wasm, deny (stops at first
+                  failure; deny is skipped when cargo-deny is not installed)
   corpus [--download]
                   show where test corpora live; --download fetches PngSuite into corpus/pngsuite
   stats [--exact] count tests and lines per crate (--exact: ask the test harness via `-- --list`)
@@ -40,6 +43,7 @@ fn main() -> ExitCode {
         Some("assets") => assets::run(&root()),
         Some("layers") => cmd_layers(),
         Some("wasm") => cmd_wasm(),
+        Some("deny") => cmd_deny(),
         Some("ci") => cmd_ci(),
         Some("corpus") => cmd_corpus(rest.contains(&"--download")),
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
@@ -153,6 +157,19 @@ fn cmd_wasm() -> Result<(), String> {
     if failed == 0 { Ok(()) } else { Err(format!("{failed} crate(s) failed the wasm check")) }
 }
 
+/// `cargo deny check` against `deny.toml`. cargo-deny is optional for contributors: without it the
+/// step prints how to install it and passes, so `cargo xtask ci` still works on a fresh machine.
+fn cmd_deny() -> Result<(), String> {
+    let installed = cargo().args(["deny", "--version"]).output().is_ok_and(|o| o.status.success());
+    if !installed {
+        println!("skip: cargo-deny is not installed (cargo install cargo-deny --locked); deny.toml not checked");
+        return Ok(());
+    }
+    let mut c = cargo();
+    c.args(["deny", "check"]);
+    run(c, "cargo deny check")
+}
+
 fn cmd_ci() -> Result<(), String> {
     type Step = (&'static str, Box<dyn Fn() -> Result<(), String>>);
     let steps: Vec<Step> = vec![
@@ -183,6 +200,7 @@ fn cmd_ci() -> Result<(), String> {
         ("assets", Box::new(|| assets::run(&root()))),
         ("layers", Box::new(cmd_layers)),
         ("wasm", Box::new(cmd_wasm)),
+        ("deny", Box::new(cmd_deny)),
     ];
     let mut done = Vec::new();
     for (name, f) in &steps {
