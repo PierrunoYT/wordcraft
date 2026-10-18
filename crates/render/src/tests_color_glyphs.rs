@@ -3,9 +3,6 @@
 use super::*;
 use wordcraft_layout::{LayoutCache, LayoutOptions, layout};
 
-/// Colour emoji families the system fallback may pick.
-const COLOR_EMOJI: &[&str] = &["Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji"];
-
 /// A strongly coloured (non-grey) pixel.
 fn colourful(p: [u8; 4]) -> bool {
     let (hi, lo) = (p[0].max(p[1]).max(p[2]), p[0].min(p[1]).min(p[2]));
@@ -51,7 +48,7 @@ fn emoji_keep_their_colours_on_a_dark_page() {
 /// pixels; None (the test skips) when no colour emoji font is installed.
 #[cfg(not(target_arch = "wasm32"))]
 fn emoji_page(opts: &RenderOptions) -> Option<(Rendered, Vec<(u32, u32, u32, u32)>)> {
-    let has_colour_font = FontDb::global().fallback_for('🧠', u32::MAX).is_some_and(|f| COLOR_EMOJI.contains(&f.family.as_str()));
+    let has_colour_font = FontDb::global().fallback_for('🧠', u32::MAX).is_some_and(|f| f.has_color_glyphs());
     if !has_colour_font {
         eprintln!("skipped: no colour emoji font installed");
         return None;
@@ -64,13 +61,13 @@ fn emoji_page(opts: &RenderOptions) -> Option<(Rendered, Vec<(u32, u32, u32, u32
     let mut boxes = vec![];
     for it in page_display(&d, page, &DisplayOptions::default()) {
         if let Draw::Glyphs { face, size, glyphs, .. } = it
-            && COLOR_EMOJI.contains(&face.family.as_str())
+            && face.has_color_glyphs()
         {
             for (_, x, y) in glyphs {
                 boxes.push((((x * scale) as u32), ((y - size) * scale) as u32, ((x + size) * scale) as u32, (y * scale) as u32));
             }
         }
     }
-    assert_eq!(boxes.len(), 2, "both emoji use the colour emoji font");
+    assert_eq!(boxes.len(), 2, "both emoji are drawn from a colour font");
     Some((img, boxes))
 }

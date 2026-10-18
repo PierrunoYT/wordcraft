@@ -15,4 +15,5 @@ harfrust = { workspace = true }
 wuff = { workspace = true }
 unicode-bidi = { workspace = true }
 unicode-script = { workspace = true }
+unicode-properties = { workspace = true }
 log = { workspace = true }

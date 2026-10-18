@@ -89,6 +89,21 @@ pub fn script_fallbacks(c: char) -> &'static [&'static str] {
     }
 }
 
+/// Is `c` drawn as an emoji by default (Unicode `Emoji_Presentation=Yes`: 🧠, ✅, regional
+/// indicators)? A fallback for such a character prefers a colour emoji font to a monochrome
+/// symbol font that also maps it (Segoe UI Symbol maps ✅). Characters that are emoji only with
+/// U+FE0F after them (☀, ♥, digits for keycaps) keep their text presentation.
+pub fn emoji_presentation(c: char) -> bool {
+    use unicode_properties::{EmojiStatus, UnicodeEmoji};
+    matches!(
+        c.emoji_status(),
+        EmojiStatus::EmojiPresentation
+            | EmojiStatus::EmojiPresentationAndModifierBase
+            | EmojiStatus::EmojiPresentationAndEmojiComponent
+            | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
+    )
+}
+
 /// How well `family` suits `c` as a fallback: 0 for the first preferred family, then the others
 /// in order; then families named after the script ("Noto Sans Tamil"); then everything else.
 pub fn fallback_rank(c: char, family: &str) -> usize {
@@ -131,5 +146,15 @@ mod tests {
         assert!(fallback_rank('မ', "Noto Sans Myanmar") < fallback_rank('မ', "Myanmar Sangam MN"));
         assert!(fallback_rank('த', "Noto Sans Tamil") < fallback_rank('த', "Arial"));
         assert_eq!(fallback_rank('a', "Arial"), fallback_rank('a', "Noto Sans"));
+    }
+
+    #[test]
+    fn emoji_presentation_follows_unicode_emoji_data() {
+        for c in ['🧠', '✅', '😀', '👍', '🇨', '🏻'] {
+            assert!(emoji_presentation(c), "{c} defaults to emoji presentation");
+        }
+        for c in ['a', '#', '1', '☀', '♥', '©', '→', ' ', '\u{FE0F}', '\u{10FFFF}'] {
+            assert!(!emoji_presentation(c), "{c:?} defaults to text presentation");
+        }
     }
 }

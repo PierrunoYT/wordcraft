@@ -5266,6 +5266,7 @@ dependencies = [
  "log",
  "skrifa 0.47.0",
  "unicode-bidi",
+ "unicode-properties",
  "unicode-script",
  "wuff",
 ]

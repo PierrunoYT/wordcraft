@@ -529,6 +529,17 @@ const SYSTEM_FALLBACKS: &[&str] = &[
     "Noto Color Emoji",
 ];
 
+/// Colour emoji families, tried first (when installed) for characters drawn as emoji by default.
+#[cfg(not(target_arch = "wasm32"))]
+const COLOR_EMOJI_FALLBACKS: &[&str] = &["Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji"];
+
+/// Is loaded face `f` (which covers `c`) the fallback for `c` without searching the system fonts?
+/// Yes unless `c` is an emoji and `f` draws it in monochrome: an installed colour emoji font is
+/// tried first.
+fn settled(c: char, f: &FontFace) -> bool {
+    !crate::emoji_presentation(c) || f.has_color_glyphs()
+}
+
 /// Arabic-script marks and digits (bidi classes NSM / AN): they belong with the Arabic letters
 /// around them when choosing a fallback font.
 fn arabic_block(c: char) -> bool {
@@ -1444,13 +1455,16 @@ impl FontDb {
     /// The fallback face for `c`, and the number of loaded faces it was chosen from.
     fn search_fallback(&self, c: char, exclude: u32) -> (Option<Arc<FontFace>>, usize) {
         let (found, n) = self.loaded_fallback(c, exclude);
-        if found.is_some() {
+        if found.as_ref().is_some_and(|f| settled(c, f)) {
             return (found, n);
         }
-        self.system_search(c, exclude)
+        // Nothing loaded covers `c`, or only a monochrome face covers an emoji: look further, and
+        // keep the monochrome face when no installed colour font has the emoji.
+        let (better, m) = self.system_search(c, exclude);
+        if better.is_some() { (better, m) } else { (found, n) }
     }
 
-    /// [`Self::search_fallback`] when no loaded face covers `c`: load a system font that does,
+    /// [`Self::search_fallback`] when no loaded face suits `c`: load a system font that does,
     /// one search at a time.
     #[cfg(not(target_arch = "wasm32"))]
     fn system_search(&self, c: char, exclude: u32) -> (Option<Arc<FontFace>>, usize) {
@@ -1458,7 +1472,12 @@ impl FontDb {
         // A search that held the lock first may have loaded a font covering `c`: choose among the
         // loaded faces again before loading more.
         let (found, n) = self.loaded_fallback(c, exclude);
-        if found.is_none() && self.system_fallback(c) {
+        if found.as_ref().is_some_and(|f| settled(c, f)) {
+            return (found, n);
+        }
+        // An emoji tries the colour emoji fonts first, even when a loaded symbol font maps it.
+        let emoji = crate::emoji_presentation(c) && self.colour_emoji_fallback(c);
+        if emoji || (found.is_none() && self.system_fallback(c)) {
             return self.loaded_fallback(c, exclude);
         }
         (found, n)
@@ -1472,7 +1491,10 @@ impl FontDb {
     /// The best loaded face covering `c`, and the number of loaded faces it was chosen from.
     fn loaded_fallback(&self, c: char, exclude: u32) -> (Option<Arc<FontFace>>, usize) {
         let faces = self.read_faces();
-        let mut order: Vec<&Arc<FontFace>> = faces.iter().filter(|f| f.id != exclude).collect();
+        let mut order: Vec<&Arc<FontFace>> = faces.iter().filter(|f| f.id != exclude && f.covers(c)).collect();
+        // Emoji prefer a colour face (Segoe UI Emoji over Segoe UI Symbol, which also maps ✅).
+        let emoji = crate::emoji_presentation(c);
+        let monochrome = |f: &FontFace| emoji && !f.has_color_glyphs();
         // Right-to-left letters prefer a font made for the script, so a word isn't split across
         // fonts (that breaks Arabic joining).
         let rank = |f: &FontFace| {
@@ -1486,8 +1508,10 @@ impl FontDb {
         // the script's own families, so syllables reorder and stack (#604).
         let complex = crate::needs_layout_tables(c);
         let shaping = |f: &FontFace| if complex { (!f.has_layout_tables(), crate::fallback_rank(c, &f.family)) } else { (false, 0) };
-        order.sort_by_key(|f| (rank(f), shaping(f), !f.family.eq_ignore_ascii_case(FALLBACK_FAMILY), f.italic, (f.weight - 400.0).abs() as i32));
-        (order.into_iter().find(|f| f.covers(c)).cloned(), faces.len())
+        order.sort_by_key(|f| {
+            (monochrome(f), rank(f), shaping(f), !f.family.eq_ignore_ascii_case(FALLBACK_FAMILY), f.italic, (f.weight - 400.0).abs() as i32)
+        });
+        (order.first().map(|f| (*f).clone()), faces.len())
     }
 
     /// One fallback face for a run's East Asian characters: the first face in the fallback order
@@ -1571,6 +1595,33 @@ impl FontDb {
         let faces = self.read_faces();
         let rtl = chars.iter().any(|c| crate::is_rtl(*c) || arabic_block(*c));
         fallback_order(&faces, exclude, rtl).into_iter().find(|f| chars.iter().all(|c| f.covers(*c))).cloned()
+    }
+
+    /// Load an installed colour emoji font covering emoji `c` ([`COLOR_EMOJI_FALLBACKS`], each
+    /// family tried once). Returns true if a loaded colour face now covers `c`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn colour_emoji_fallback(&self, c: char) -> bool {
+        {
+            let sys = self.sys.lock().unwrap_or_else(|e| e.into_inner());
+            if !sys.enabled || COLOR_EMOJI_FALLBACKS.iter().all(|f| sys.tried.contains(f)) {
+                return false;
+            }
+        }
+        let covered = |db: &FontDb| db.read_faces().iter().any(|f| f.covers(c) && f.has_color_glyphs());
+        let cataloged: Vec<String> = self.read_catalog().iter().map(|e| e.family.clone()).collect();
+        for fam in COLOR_EMOJI_FALLBACKS {
+            if self.is_loaded(fam) || !cataloged.iter().any(|f| f.eq_ignore_ascii_case(fam)) {
+                continue;
+            }
+            if !self.sys.lock().unwrap_or_else(|e| e.into_inner()).tried.insert(fam) {
+                continue;
+            }
+            self.load_cataloged(fam);
+            if covered(self) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Load a system font covering `c` (preferred fallback families first, then any cataloged
@@ -1735,6 +1786,30 @@ mod tests {
         drop(cache);
         db.set_system_fallback(false);
         assert!(db.ea_fallbacks.read().unwrap().map.is_empty());
+    }
+
+    /// System-dependent (skips without an installed colour emoji font): an emoji falls back to a
+    /// colour emoji font even when a monochrome symbol font that maps it is already loaded (✅ in
+    /// Segoe UI Symbol drew black on Windows). Text-presentation symbols keep the loaded face.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn emoji_fall_back_to_a_colour_font_before_a_loaded_symbol_font() {
+        let db = FontDb::with_font_dirs(system_font_dirs());
+        let families = db.families();
+        let installed = |f: &str| families.iter().any(|g| g.eq_ignore_ascii_case(f));
+        if !COLOR_EMOJI_FALLBACKS.iter().any(|f| installed(f)) {
+            eprintln!("skipped: no colour emoji font installed");
+            return;
+        }
+        for fam in ["Segoe UI Symbol", "Noto Emoji", "Apple Symbols", "Noto Sans Symbols2"].into_iter().filter(|f| installed(f)) {
+            let _ = db.face(fam, "Regular");
+        }
+        for c in ['✅', '🧠'] {
+            let f = db.fallback_for(c, u32::MAX);
+            assert!(f.as_ref().is_some_and(|f| f.has_color_glyphs()), "{c} fell back to {:?}", f.map(|f| f.family.clone()));
+        }
+        // Cached: asking again keeps the colour face.
+        assert!(db.fallback_for('✅', u32::MAX).is_some_and(|f| f.has_color_glyphs()));
     }
 
     #[test]
