@@ -16,9 +16,11 @@
 //!
 //! Every file is hostile: zip entries are inflated up to [`MAX_ENTRY`] (and [`MAX_TOTAL`] in
 //! all), sheets, rows, columns, cells and string lengths are capped, repeat counts are clamped to
-//! what is left, and nothing recurses, so XML depth costs nothing.
+//! what is left, all the cell text kept is capped at [`MAX_TOTAL_TEXT`] (a repeated cell or a
+//! shared string counts each time it is used; rows past it are ignored), and nothing recurses,
+//! so XML depth costs nothing.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor, Read};
 
 use quick_xml::XmlVersion;
@@ -46,6 +48,9 @@ pub const MAX_COLS: usize = 1_000;
 pub const MAX_CELLS: usize = 2_000_000;
 /// Longest cell text in characters (a spreadsheet cell's own limit).
 pub const MAX_CELL_CHARS: usize = 32_767;
+/// Most bytes of cell text kept in all, each repeat and shared-string use counted (WC-15): a
+/// long string repeated across columns and rows would otherwise multiply into gigabytes.
+pub const MAX_TOTAL_TEXT: usize = 64 << 20;
 /// Most shared strings kept.
 const MAX_SHARED: usize = 2_000_000;
 /// Most cell formats kept.
@@ -134,18 +139,28 @@ pub fn read_rows(bytes: &[u8], pick: Pick<'_>) -> Result<(Vec<String>, Vec<Vec<S
 /// repeats numbered (`Name`, `Name 2`), ignoring case as merge fields do.
 pub fn field_names(row: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(row.len());
+    // Names taken (ASCII-lowercased), and per base the next number to try: every lower one was
+    // taken when it was tried and still is, so each base resumes where it stopped (linear).
+    let mut taken: HashSet<String> = HashSet::with_capacity(row.len());
+    let mut next: HashMap<String, usize> = HashMap::new();
     for (i, h) in row.iter().enumerate() {
         let base = match h.trim() {
             "" => format!("Column {}", i + 1),
             t => t.to_string(),
         };
-        let taken = |n: &str, out: &[String]| out.iter().any(|o| o.eq_ignore_ascii_case(n));
+        let key = base.to_ascii_lowercase();
         let mut name = base.clone();
-        let mut k = 2usize;
-        while taken(&name, &out) {
-            name = format!("{base} {k}");
-            k = k.saturating_add(1);
+        if taken.contains(&key) {
+            let k = next.entry(key).or_insert(2);
+            loop {
+                name = format!("{base} {k}");
+                *k = k.saturating_add(1);
+                if !taken.contains(&name.to_ascii_lowercase()) {
+                    break;
+                }
+            }
         }
+        taken.insert(name.to_ascii_lowercase());
         out.push(name);
     }
     out
@@ -297,25 +312,67 @@ fn attr(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
     })
 }
 
-/// `s` + `t`, keeping `s` at most [`MAX_CELL_CHARS`] characters.
-fn push_capped(s: &mut String, t: &str) {
-    let have = s.chars().count();
-    if have < MAX_CELL_CHARS {
-        s.extend(t.chars().take(MAX_CELL_CHARS - have));
+/// Cell text growing event by event, kept to at most [`MAX_CELL_CHARS`] characters (counted as
+/// it grows, so many small pieces cost linear time).
+#[derive(Default)]
+struct CellText {
+    text: String,
+    chars: usize,
+}
+
+impl CellText {
+    fn push(&mut self, t: &str) {
+        for c in t.chars().take(MAX_CELL_CHARS.saturating_sub(self.chars)) {
+            self.text.push(c);
+            self.chars += 1;
+        }
     }
 }
 
-/// Rows collected under the caps: blank rows are dropped, rows past [`MAX_ROWS`] and cells past
-/// [`MAX_CELLS`] are ignored.
+/// What is left of [`MAX_TOTAL_TEXT`]; once a value doesn't fit nothing more is taken, so a
+/// list is cut at a row rather than left with holes.
+struct TextBudget {
+    left: usize,
+}
+
+impl Default for TextBudget {
+    fn default() -> Self {
+        TextBudget { left: MAX_TOTAL_TEXT }
+    }
+}
+
+impl TextBudget {
+    /// Charge `bytes`; false (and spent from now on) when they don't fit.
+    fn take(&mut self, bytes: usize) -> bool {
+        match self.left.checked_sub(bytes) {
+            Some(left) => {
+                self.left = left;
+                true
+            }
+            None => {
+                self.left = 0;
+                false
+            }
+        }
+    }
+
+    fn spent(&self) -> bool {
+        self.left == 0
+    }
+}
+
+/// Rows collected under the caps: blank rows are dropped, rows past [`MAX_ROWS`], cells past
+/// [`MAX_CELLS`] and rows past [`MAX_TOTAL_TEXT`] are ignored.
 #[derive(Default)]
 struct Grid {
     rows: Vec<Vec<String>>,
     cells: usize,
+    text: TextBudget,
 }
 
 impl Grid {
     fn full(&self) -> bool {
-        self.rows.len() >= MAX_ROWS || self.cells >= MAX_CELLS
+        self.rows.len() >= MAX_ROWS || self.cells >= MAX_CELLS || self.text.spent()
     }
 
     /// Keep `row` (trailing blanks trimmed) `times` times, as far as the caps allow.
@@ -326,11 +383,17 @@ impl Grid {
         if row.is_empty() {
             return;
         }
+        let bytes = row.iter().fold(0usize, |n, c| n.saturating_add(c.len()));
         let mut left = times;
         while left > 0 && !self.full() {
             let room = MAX_CELLS.saturating_sub(self.cells);
-            let mut r = row.clone();
-            r.truncate(room);
+            let keep = row.len().min(room);
+            let size = if keep == row.len() { bytes } else { row.iter().take(keep).fold(0usize, |n, c| n.saturating_add(c.len())) };
+            // Charged before the copy is made, so a refused row costs nothing.
+            if !self.text.take(size) {
+                return;
+            }
+            let r = if left == 1 && keep == row.len() { std::mem::take(&mut row) } else { row.iter().take(keep).cloned().collect() };
             self.cells = self.cells.saturating_add(r.len());
             self.rows.push(r);
             left -= 1;
@@ -438,11 +501,11 @@ fn xlsx_sheets(pkg: &mut Package<'_>) -> Result<Vec<SheetRef>, String> {
 /// (`rPh`) left out.
 fn shared_strings(xml: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
-    let mut cur: Option<String> = None;
+    let mut cur: Option<CellText> = None;
     let (mut in_t, mut phonetic) = (false, 0usize);
     walk(xml, |ev| match ev {
         Ev::Start(e) => match e.local_name().as_ref() {
-            b"si" => cur = Some(String::new()),
+            b"si" => cur = Some(CellText::default()),
             b"t" => in_t = true,
             b"rPh" => phonetic += 1,
             _ => {}
@@ -452,7 +515,7 @@ fn shared_strings(xml: &[u8]) -> Vec<String> {
                 if let Some(s) = cur.take()
                     && out.len() < MAX_SHARED
                 {
-                    out.push(s);
+                    out.push(s.text);
                 }
             }
             b"t" => in_t = false,
@@ -464,7 +527,7 @@ fn shared_strings(xml: &[u8]) -> Vec<String> {
                 && phonetic == 0
                 && let Some(s) = cur.as_mut()
             {
-                push_capped(s, &t);
+                s.push(&t);
             }
         }
     });
@@ -575,8 +638,8 @@ struct XCell {
     col: usize,
     kind: String,
     style: usize,
-    value: String,
-    inline: String,
+    value: CellText,
+    inline: CellText,
 }
 
 fn xlsx_rows(pkg: &mut Package<'_>, path: &str) -> Result<Vec<Vec<String>>, String> {
@@ -593,6 +656,8 @@ fn xlsx_rows(pkg: &mut Package<'_>, path: &str) -> Result<Vec<Vec<String>>, Stri
     // Rows by number, so out-of-order rows still come out in order.
     let mut rows: BTreeMap<u64, Vec<String>> = BTreeMap::new();
     let mut cells = 0usize;
+    // Each use of a shared string is a copy, so the text kept is charged per cell.
+    let mut budget = TextBudget::default();
     let (mut in_data, mut row_no, mut next_col) = (false, 0u64, 0usize);
     let mut cell: Option<XCell> = None;
     let (mut in_v, mut in_is_t, mut phonetic) = (false, false, 0usize);
@@ -621,9 +686,9 @@ fn xlsx_rows(pkg: &mut Package<'_>, path: &str) -> Result<Vec<Vec<String>>, Stri
         Ev::Text(t) => {
             if let Some(c) = cell.as_mut() {
                 if in_v {
-                    push_capped(&mut c.value, &t);
+                    c.value.push(&t);
                 } else if in_is_t && phonetic == 0 {
-                    push_capped(&mut c.inline, &t);
+                    c.inline.push(&t);
                 }
             }
         }
@@ -639,6 +704,9 @@ fn xlsx_rows(pkg: &mut Package<'_>, path: &str) -> Result<Vec<Vec<String>>, Stri
                     return;
                 }
                 if !rows.contains_key(&row_no) && rows.len() >= MAX_ROWS {
+                    return;
+                }
+                if !budget.take(text.len()) {
                     return;
                 }
                 let row = rows.entry(row_no).or_default();
@@ -665,14 +733,14 @@ fn xlsx_rows(pkg: &mut Package<'_>, path: &str) -> Result<Vec<Vec<String>>, Stri
 }
 
 fn xlsx_value(c: &XCell, shared: &[String], formats: &[Option<DateKind>], date1904: bool) -> String {
-    let v = c.value.trim();
+    let v = c.value.text.trim();
     match c.kind.as_str() {
         "s" => v.parse::<usize>().ok().and_then(|i| shared.get(i)).cloned().unwrap_or_default(),
-        "inlineStr" => c.inline.clone(),
-        "str" | "e" => c.value.clone(),
+        "inlineStr" => c.inline.text.clone(),
+        "str" | "e" => c.value.text.clone(),
         "b" => if v == "1" || v.eq_ignore_ascii_case("true") { "TRUE" } else { "FALSE" }.into(),
         "d" => iso_datetime(v).unwrap_or_else(|| v.to_string()),
-        _ if v.is_empty() => c.inline.clone(),
+        _ if v.is_empty() => c.inline.text.clone(),
         _ => {
             let Ok(x) = v.parse::<f64>() else { return v.to_string() };
             match formats.get(c.style).copied().flatten() {
@@ -789,8 +857,19 @@ struct OCell {
     repeat: u64,
     kind: String,
     value: Option<String>,
-    text: String,
+    text: CellText,
     paras: usize,
+}
+
+/// An OpenDocument row being read.
+#[derive(Default)]
+struct ORow {
+    cells: Vec<String>,
+    /// Blank cells not written yet (a value after them writes them).
+    pending: u64,
+    repeat: u64,
+    /// Bytes of text in `cells`.
+    bytes: usize,
 }
 
 /// The sheet names of `content.xml`, and with `want` that sheet's rows (ODF 1.3 §9.1).
@@ -801,7 +880,7 @@ fn ods_read(xml: &[u8], want: Option<usize>) -> Result<(Vec<String>, Vec<Vec<Str
     // one is the wanted sheet.
     let mut tables = 0usize;
     let mut collecting = false;
-    let mut row: Option<(Vec<String>, u64, u64)> = None; // cells, pending blank cells, repeat
+    let mut row: Option<ORow> = None;
     let mut cell: Option<OCell> = None;
     let (mut in_p, mut skip) = (0usize, 0usize);
     walk(xml, |ev| match ev {
@@ -822,7 +901,7 @@ fn ods_read(xml: &[u8], want: Option<usize>) -> Result<(Vec<String>, Vec<Vec<Str
             match n {
                 b"table-row" => {
                     let repeat = attr(e, b"number-rows-repeated").and_then(|v| v.trim().parse().ok()).unwrap_or(1u64).max(1);
-                    row = Some((Vec::new(), 0, repeat));
+                    row = Some(ORow { repeat, ..Default::default() });
                 }
                 b"table-cell" | b"covered-table-cell" if row.is_some() => {
                     let repeat = attr(e, b"number-columns-repeated").and_then(|v| v.trim().parse().ok()).unwrap_or(1u64).max(1);
@@ -852,7 +931,7 @@ fn ods_read(xml: &[u8], want: Option<usize>) -> Result<(Vec<String>, Vec<Vec<Str
                         && skip == 0
                     {
                         if c.paras > 0 {
-                            push_capped(&mut c.text, "\n");
+                            c.text.push("\n");
                         }
                         c.paras += 1;
                     }
@@ -861,17 +940,17 @@ fn ods_read(xml: &[u8], want: Option<usize>) -> Result<(Vec<String>, Vec<Vec<Str
                 b"s" if in_p > 0 && skip == 0 => {
                     let k = attr(e, b"c").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, 1_000);
                     if let Some(c) = cell.as_mut() {
-                        push_capped(&mut c.text, &" ".repeat(k));
+                        c.text.push(&" ".repeat(k));
                     }
                 }
                 b"tab" if in_p > 0 && skip == 0 => {
                     if let Some(c) = cell.as_mut() {
-                        push_capped(&mut c.text, "\t");
+                        c.text.push("\t");
                     }
                 }
                 b"line-break" if in_p > 0 && skip == 0 => {
                     if let Some(c) = cell.as_mut() {
-                        push_capped(&mut c.text, "\n");
+                        c.text.push("\n");
                     }
                 }
                 _ => {}
@@ -882,7 +961,7 @@ fn ods_read(xml: &[u8], want: Option<usize>) -> Result<(Vec<String>, Vec<Vec<Str
                 && skip == 0
                 && let Some(c) = cell.as_mut()
             {
-                push_capped(&mut c.text, &t);
+                c.text.push(&t);
             }
         }
         Ev::End(n) => {
@@ -904,23 +983,31 @@ fn ods_read(xml: &[u8], want: Option<usize>) -> Result<(Vec<String>, Vec<Vec<Str
                     if n == b"covered-table-cell" {
                         skip = skip.saturating_sub(1);
                     }
-                    let (Some(c), Some((cells, pending, _))) = (cell.take(), row.as_mut()) else { return };
+                    let (Some(c), Some(r)) = (cell.take(), row.as_mut()) else { return };
                     let text = ods_value(&c);
                     if text.is_empty() {
-                        *pending = pending.saturating_add(c.repeat);
+                        r.pending = r.pending.saturating_add(c.repeat);
                         return;
                     }
                     // Blank cells before this one, then the value as often as it repeats, as far
                     // as the columns allow.
-                    let blanks = (*pending).min(MAX_COLS.saturating_sub(cells.len()) as u64) as usize;
-                    cells.resize(cells.len() + blanks, String::new());
-                    *pending = 0;
-                    let times = c.repeat.min(MAX_COLS.saturating_sub(cells.len()) as u64) as usize;
-                    cells.extend(std::iter::repeat_n(text, times));
+                    let blanks = r.pending.min(MAX_COLS.saturating_sub(r.cells.len()) as u64) as usize;
+                    r.cells.resize(r.cells.len() + blanks, String::new());
+                    r.pending = 0;
+                    let times = c.repeat.min(MAX_COLS.saturating_sub(r.cells.len()) as u64) as usize;
+                    // A row that outgrows the text budget isn't built: it, and every row after
+                    // it, is dropped.
+                    let size = times.saturating_mul(text.len());
+                    if r.bytes.saturating_add(size) > grid.text.left {
+                        grid.text.left = 0;
+                        return;
+                    }
+                    r.bytes = r.bytes.saturating_add(size);
+                    r.cells.extend(std::iter::repeat_n(text, times));
                 }
                 b"table-row" => {
-                    if let Some((cells, _, repeat)) = row.take() {
-                        grid.push(cells, repeat);
+                    if let Some(r) = row.take() {
+                        grid.push(r.cells, r.repeat);
                     }
                 }
                 _ => {}
@@ -936,11 +1023,11 @@ fn ods_read(xml: &[u8], want: Option<usize>) -> Result<(Vec<String>, Vec<Vec<Str
 fn ods_value(c: &OCell) -> String {
     let v = c.value.as_deref().map(str::trim);
     match (c.kind.as_str(), v) {
-        ("float", Some(v)) => v.parse::<f64>().map(number).unwrap_or_else(|_| c.text.clone()),
-        ("date", Some(v)) => iso_datetime(v).unwrap_or_else(|| c.text.clone()),
-        ("time", Some(v)) => iso_time(v).unwrap_or_else(|| c.text.clone()),
+        ("float", Some(v)) => v.parse::<f64>().map(number).unwrap_or_else(|_| c.text.text.clone()),
+        ("date", Some(v)) => iso_datetime(v).unwrap_or_else(|| c.text.text.clone()),
+        ("time", Some(v)) => iso_time(v).unwrap_or_else(|| c.text.text.clone()),
         ("boolean", Some(v)) => if v.eq_ignore_ascii_case("true") || v == "1" { "TRUE" } else { "FALSE" }.into(),
-        _ => c.text.clone(),
+        _ => c.text.text.clone(),
     }
 }
 
@@ -1050,6 +1137,78 @@ mod tests {
             let _ = sheet_names(junk);
             let _ = read_rows(junk, Pick::Index(0));
         }
+    }
+
+    fn total_text(rows: &[Vec<String>]) -> usize {
+        rows.iter().flatten().map(String::len).sum()
+    }
+
+    #[test]
+    fn repeated_long_cells_stop_at_the_text_budget() {
+        // WC-15: one 32,767-character cell repeated 1,000 columns × 1M rows would be about 65 GB.
+        let long = "x".repeat(MAX_CELL_CHARS);
+        let content = format!(
+            r#"<office:document-content xmlns:office="o" xmlns:table="t" xmlns:text="x"><office:body><office:spreadsheet><table:table table:name="S"><table:table-row table:number-rows-repeated="1000000"><table:table-cell office:value-type="string" table:number-columns-repeated="1000"><text:p>{long}</text:p></table:table-cell></table:table-row><table:table-row><table:table-cell office:value-type="string"><text:p>tail</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#
+        );
+        let book = zip(&[("mimetype", "application/vnd.oasis.opendocument.spreadsheet"), ("content.xml", &content)]);
+        let (_, rows) = read_rows(&book, Pick::Index(0)).unwrap();
+        // Two whole rows fit 64 MiB; the third doesn't, and nothing after it is kept.
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.len() == 1_000));
+        assert!(total_text(&rows) <= MAX_TOTAL_TEXT);
+        // A row that alone outgrows the budget isn't built at all (1,000 columns × 98 KB).
+        let wide = "中".repeat(MAX_CELL_CHARS);
+        let content = content.replace(&long, &wide).replace("1000000", "1");
+        let book = zip(&[("mimetype", "application/vnd.oasis.opendocument.spreadsheet"), ("content.xml", &content)]);
+        let (_, rows) = read_rows(&book, Pick::Index(0)).unwrap();
+        assert!(rows.is_empty(), "{} rows", rows.len());
+    }
+
+    #[test]
+    fn shared_strings_count_against_the_text_budget_per_use() {
+        let long = "y".repeat(MAX_CELL_CHARS);
+        let sst = format!(r#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>{long}</t></si></sst>"#);
+        let rows: String = (1..=3_000).map(|n| format!(r#"<row r="{n}"><c r="A{n}" t="s"><v>0</v></c></row>"#)).collect();
+        let sheet = format!(r#"<worksheet><sheetData>{rows}</sheetData></worksheet>"#);
+        let wb = r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let wb_rels = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#;
+        let book = zip(&[
+            ("_rels/.rels", RELS),
+            ("xl/workbook.xml", wb),
+            ("xl/_rels/workbook.xml.rels", wb_rels),
+            ("xl/sharedStrings.xml", &sst),
+            ("xl/worksheets/sheet1.xml", &sheet),
+        ]);
+        let (_, rows) = read_rows(&book, Pick::Index(0)).unwrap();
+        assert_eq!(rows.len(), MAX_TOTAL_TEXT / MAX_CELL_CHARS);
+        assert!(total_text(&rows) <= MAX_TOTAL_TEXT);
+    }
+
+    #[test]
+    fn cell_text_from_many_pieces_is_capped_in_linear_time() {
+        // Every `&amp;` is its own XML event; recounting the cell on each was quadratic.
+        let pieces = "&amp;".repeat(200_000);
+        let sheet = format!(r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{pieces}</t></is></c></row></sheetData></worksheet>"#);
+        let (_, rows) = read_rows(&xlsx(&sheet), Pick::Index(0)).unwrap();
+        assert_eq!(rows[0][0], "&".repeat(MAX_CELL_CHARS));
+        let mut t = CellText::default();
+        t.push("ab");
+        t.push(&"中".repeat(MAX_CELL_CHARS));
+        t.push("z");
+        assert_eq!((t.chars, t.text.chars().count()), (MAX_CELL_CHARS, MAX_CELL_CHARS));
+        assert!(t.text.starts_with("ab中") && t.text.ends_with('中'));
+    }
+
+    #[test]
+    fn field_names_number_repeats_in_linear_time() {
+        let row: Vec<String> = ["a", "a 2", "a", "A", "", "a", "a 2"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(field_names(&row), ["a", "a 2", "a 3", "A 4", "Column 5", "a 5", "a 2 2"]);
+        // 20,000 identical headers: cubic before, instant now.
+        let same = vec!["Name".to_string(); 20_000];
+        let names = field_names(&same);
+        assert_eq!(names[0], "Name");
+        assert_eq!(names[19_999], "Name 20000");
+        assert_eq!(names.iter().map(|n| n.to_ascii_lowercase()).collect::<HashSet<_>>().len(), 20_000);
     }
 
     #[test]

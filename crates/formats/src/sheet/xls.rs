@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read};
 
 use super::{
-    DateKind, Grid, MAX_CELL_CHARS, MAX_CELLS, MAX_COLS, MAX_ENTRY, MAX_SHARED, MAX_SHEETS, MAX_XFS, builtin_date, custom_date, number, serial_date,
+    DateKind, Grid, MAX_CELL_CHARS, MAX_CELLS, MAX_COLS, MAX_ENTRY, MAX_SHARED, MAX_SHEETS, MAX_XFS, TextBudget, builtin_date, custom_date, number,
+    serial_date,
 };
 
 /// The compound-file signature every `.xls` (and `.doc`) starts with.
@@ -300,8 +301,10 @@ fn sheet_rows(stream: &[u8], offset: usize, g: &Globals) -> Result<Vec<Vec<Strin
         Some(kind) => serial_date(x, g.date1904, kind).unwrap_or_else(|| number(x)),
         None => number(x),
     };
+    // Each LABELSST is a copy of its shared string, so the text kept is charged per cell.
+    let mut budget = TextBudget::default();
     let mut put = |row: u16, col: u16, v: String, count: &mut usize| {
-        if usize::from(col) >= MAX_COLS || *count >= MAX_CELLS || v.is_empty() {
+        if usize::from(col) >= MAX_COLS || *count >= MAX_CELLS || v.is_empty() || !budget.take(v.len()) {
             return;
         }
         if cells.entry(row).or_default().insert(col, v).is_none() {
@@ -527,6 +530,17 @@ mod tests {
         let b: &[u8] = &[1, 0x2D, 0x4E, 0x87, 0x65];
         let mut p = Pieces::new(vec![a, b]);
         assert_eq!(p.rich_string().as_deref(), Some("AB中文"));
+    }
+
+    #[test]
+    fn shared_strings_count_against_the_text_budget_per_use() {
+        // WC-15: each LABELSST copies its shared string; 2,100 uses of a 32,767-character string
+        // outgrow the 64 MiB budget, so the rows stop where it is spent.
+        let long = "x".repeat(MAX_CELL_CHARS);
+        let book = build(&[("S", vec![vec![long]; 2_100])]).unwrap();
+        let (_, r) = read_rows(&book, Pick::Index(0)).unwrap();
+        assert_eq!(r.len(), super::super::MAX_TOTAL_TEXT / MAX_CELL_CHARS);
+        assert!(r.iter().flatten().map(String::len).sum::<usize>() <= super::super::MAX_TOTAL_TEXT);
     }
 
     #[test]
