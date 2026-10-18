@@ -72,8 +72,8 @@ fn case_variant_targets_keep_one_picture() {
         d.body.iter().filter_map(|b| b.as_para()).flat_map(|p| p.objects.iter()).filter(|o| matches!(o, InlineObject::Image { .. })).count();
     assert_eq!(pictures, 64);
     let out = wordcraft_docx::write(&d).unwrap();
-    let z = zip::ZipArchive::new(std::io::Cursor::new(out)).unwrap();
-    let mut names: Vec<String> = z.file_names().map(str::to_ascii_lowercase).collect();
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(out)).unwrap();
+    let mut names: Vec<String> = (0..z.len()).map(|i| String::from_utf8_lossy(z.by_index_raw(i).unwrap().name_raw()).to_ascii_lowercase()).collect();
     let all = names.len();
     names.sort();
     names.dedup();

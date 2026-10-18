@@ -202,8 +202,9 @@ impl Package {
         // data would make one small stream inflate once per entry.
         let mut ranges: BTreeMap<u64, u64> = BTreeMap::new();
         for i in 0..zip.len() {
-            // Taken before the entry is opened, which borrows the archive: a failed open reports it.
-            let name = zip.name_for_index(i).map_or_else(|| format!("zip entry {}", i.saturating_add(1)), |n| n.trim_start_matches('/').to_string());
+            // Named from the raw entry (nothing inflated) before the entry is opened, which borrows
+            // the archive: a failed open reports it.
+            let name = zip.by_index_raw(i).map_or_else(|_| format!("zip entry {}", i.saturating_add(1)), |raw| entry_name(raw.name_raw()));
             let mut f = match zip.by_index(i) {
                 Ok(f) => f,
                 Err(e) => {
@@ -218,7 +219,7 @@ impl Package {
             if f.size() > max_part {
                 return Err(DocxError::Limit(format!("part {name} declares {} bytes", f.size())));
             }
-            let start = f.data_start();
+            let start = local_data_start(bytes, f.header_start()).unwrap_or(f.header_start());
             let end = start.saturating_add(f.compressed_size());
             if end > start {
                 let before = ranges.range(..=start).next_back().is_some_and(|(_, e)| *e > start);
@@ -326,6 +327,25 @@ impl Package {
         }
         rels
     }
+}
+
+/// A zip entry's part name from its raw bytes, without the leading `/`. OPC part names are
+/// ASCII (non-ASCII percent-encoded) and producers write UTF-8, so the bytes are read as
+/// UTF-8. (The raw name and the header offset, unlike the decoded name and data offset, have
+/// kept their types across zip crate versions.)
+fn entry_name(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw).trim_start_matches('/').to_string()
+}
+
+/// Where the data of the zip entry whose local file header starts at `header` begins in the
+/// archive `bytes`: past the header's 30 fixed bytes, its name and its extra field (PKWARE
+/// APPNOTE §4.3.7). `None` if the header isn't in `bytes`.
+fn local_data_start(bytes: &[u8], header: u64) -> Option<u64> {
+    let at = usize::try_from(header).ok()?;
+    let lens = bytes.get(at.checked_add(26)?..at.checked_add(30)?)?;
+    let [n0, n1, e0, e1] = <[u8; 4]>::try_from(lens).ok()?;
+    let skip = 30u64.saturating_add(u64::from(u16::from_le_bytes([n0, n1]))).saturating_add(u64::from(u16::from_le_bytes([e0, e1])));
+    Some(header.saturating_add(skip))
 }
 
 /// A zip entry name fit for a report line: control characters replaced, at most
@@ -591,6 +611,22 @@ mod tests {
         };
         let u = take_unreadable_parts(&mut crate::read(&package_with_broken_parts(truncated)).unwrap()).unwrap();
         assert_eq!(u.names, ["customXml/item1.xml", "word/media/x.bin"]);
+    }
+
+    /// WC-23: the data offset worked out from the local header is where the entry's bytes are.
+    #[test]
+    fn local_data_start_finds_the_entry_data() {
+        let data = b"stored, not deflated".to_vec();
+        let z = zip_of(&[("word/media/a.png", data.clone()), ("word/media/b.png", b"second".to_vec())]);
+        let mut zip = zip::ZipArchive::new(Cursor::new(&z[..])).unwrap();
+        for (i, want) in [(0, &data[..]), (1, &b"second"[..])] {
+            let header = zip.by_index_raw(i).unwrap().header_start();
+            let start = usize::try_from(local_data_start(&z, header).unwrap()).unwrap();
+            assert_eq!(z.get(start..start + want.len()), Some(want));
+        }
+        assert_eq!(local_data_start(&z, z.len() as u64 - 10), None);
+        assert_eq!(local_data_start(&z, u64::MAX), None);
+        assert_eq!(entry_name(b"/word/document.xml"), "word/document.xml");
     }
 
     /// WC-23: the report keeps a bounded number of tidied names but counts every entry.
