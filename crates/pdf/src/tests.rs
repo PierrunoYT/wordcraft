@@ -1486,3 +1486,23 @@ fn bundled_unicode_glyphs_are_visible_and_extractable() {
     assert!(String::from_utf8_lossy(&bytes).contains("/ToUnicode"));
     assert_eq!(squash(&extract_text(&bytes).concat()), TEXT);
 }
+
+#[test]
+fn wc19_oversized_pictures_are_embedded_shrunk_to_the_budget() {
+    let encode = |img: image::DynamicImage, fmt| {
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), fmt).unwrap();
+        Arc::new(buf)
+    };
+    let grey = |w, h| image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(w, h, image::Luma([128])));
+    // Within the budget: the picture's own size, as before.
+    assert_eq!(load_image(&Arc::new(png())).unwrap().size(), (16, 8));
+    assert_eq!(load_image_within(&encode(grey(40, 10), image::ImageFormat::Png), 400).unwrap().size(), (40, 10));
+    assert_eq!(load_image_within(&encode(grey(40, 10), image::ImageFormat::Jpeg), 400).unwrap().size(), (40, 10));
+    // Over it: shrunk alike on both sides (a JPEG too, so it is no longer passed through whole).
+    assert_eq!(load_image_within(&encode(grey(400, 100), image::ImageFormat::Png), 400).unwrap().size(), (40, 10));
+    assert_eq!(load_image_within(&encode(grey(400, 100), image::ImageFormat::Jpeg), 400).unwrap().size(), (40, 10));
+    assert!(load_image_within(&Arc::new(b"not an image".to_vec()), 400).is_none());
+    // A thin strip keeps a pixel on its short side and stays within the budget.
+    assert_eq!(shrunk(10_000, 1, 100), (100, 1));
+}

@@ -172,17 +172,64 @@ fn vectors() -> &'static Mutex<MediaCache<Option<Arc<Vector>>>> {
 /// a small file that declares a bigger image at header time, before anything is allocated.
 const MAX_DECODE_SIDE: u32 = u16::MAX as u32;
 
-/// Decode an encoded image to a premultiplied pixmap. The dimension limit above and the default
-/// allocation cap (512 MB, what `load_from_memory` applied) bound the decode during paint.
+/// Most pixels a decoded document picture keeps (24 Mpx, 96 MB of RGBA: a 24-megapixel camera photo
+/// at full size). A larger picture is shrunk to fit as it decodes, so it still shows, and its pixmap
+/// fits the cache rather than being decoded again on every paint (WC-19).
+const MAX_PICTURE_PIXELS: u64 = 24 * 1024 * 1024;
+/// Fewest pixels a picture is shrunk to when its source bytes leave little of the cache budget.
+const MIN_PICTURE_PIXELS: u64 = 1024 * 1024;
+/// Most bytes a picture's decoder may allocate (the 512 MB `load_from_memory` applied).
+const MAX_DECODE_ALLOC: u64 = 512 * 1024 * 1024;
+
+/// Decode an encoded image to a premultiplied pixmap of at most [`MAX_PICTURE_PIXELS`] (see
+/// [`decode_rgba`]).
 pub fn decode_pixmap(bytes: &[u8]) -> Option<Pixmap> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_DECODE_SIDE);
-    limits.max_image_height = Some(MAX_DECODE_SIDE);
-    reader.limits(limits);
-    let img = reader.decode().ok()?.to_rgba8();
+    let img = decode_rgba(bytes, MAX_DECODE_SIDE, MAX_PICTURE_PIXELS)?;
     let (w, h) = img.dimensions();
     premul_pixmap(w, h, img.as_raw())
+}
+
+/// Decode an encoded image to straight RGBA8, shrunk uniformly (averaging) to at most `max_pixels`
+/// when larger. The header is read first: a side over `max_side` is refused, and the decoder may
+/// allocate only what an image of the declared size needs (up to 16 bytes a pixel, float RGBA, plus
+/// room for metadata), never past [`MAX_DECODE_ALLOC`]. A picture within the budget decodes exactly
+/// as before.
+fn decode_rgba(bytes: &[u8], max_side: u32, max_pixels: u64) -> Option<image::RgbaImage> {
+    let (w, h) = image_size(bytes)?;
+    if w == 0 || h == 0 || w > max_side || h > max_side {
+        return None;
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max_side);
+    limits.max_image_height = Some(max_side);
+    let need = (w as u64 * h as u64).saturating_mul(16).saturating_add(16 * 1024 * 1024);
+    limits.max_alloc = Some(need.min(MAX_DECODE_ALLOC));
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
+    let (w, h) = (img.width(), img.height());
+    if w as u64 * h as u64 <= max_pixels.max(1) {
+        return Some(img.into_rgba8());
+    }
+    let (sw, sh) = shrunk(w, h, max_pixels);
+    let small = img.thumbnail_exact(sw, sh);
+    drop(img);
+    Some(small.into_rgba8())
+}
+
+/// `w`×`h` scaled uniformly (rounding down) to at most `max_pixels`; a side that would round to
+/// nothing keeps 1 pixel, and the other side then takes the whole budget.
+fn shrunk(w: u32, h: u32, max_pixels: u64) -> (u32, u32) {
+    let max = max_pixels.max(1);
+    let k = (max as f64 / (w as u64 * h as u64).max(1) as f64).sqrt().min(1.0);
+    let side = |v: u32| ((v as f64 * k).floor() as u32).clamp(1, v.max(1));
+    let (sw, sh) = (side(w), side(h));
+    let cap = |v: u32| max.min(v as u64) as u32;
+    match (sw, sh) {
+        (1, _) => (1, cap(sh)),
+        (_, 1) => (cap(sw), 1),
+        _ => (sw, sh),
+    }
 }
 
 /// A premultiplied pixmap from straight RGBA8 rows. None for empty, oversized or mis-sized input
@@ -350,10 +397,10 @@ const MAX_BACKGROUND_PIXELS: u64 = 64 * 1024 * 1024;
 fn draw_page_picture(ctx: &mut RenderContext, doc: &Document, page: &Page, view: Affine) {
     let Some(pic) = &doc.settings.page_picture else { return };
     let Some(bytes) = doc.media.get(&pic.media) else { return };
-    match image_size(bytes) {
-        Some((w, h)) if w > 0 && h > 0 && (w as u64) * (h as u64) <= MAX_BACKGROUND_PIXELS => {}
+    let (nw, nh) = match image_size(bytes) {
+        Some((w, h)) if w > 0 && h > 0 && (w as u64) * (h as u64) <= MAX_BACKGROUND_PIXELS => (w as f64, h as f64),
         _ => return,
-    }
+    };
     let Some(pm) = pixmap_for(doc, &pic.media) else { return };
     let (pw, ph) = (pm.width().max(1) as f64, pm.height().max(1) as f64);
     let (w, h) = (page.w as f64, (page.h as f64).min(1e6));
@@ -361,7 +408,8 @@ fn draw_page_picture(ctx: &mut RenderContext, doc: &Document, page: &Page, view:
         return;
     }
     let tile = pic.fill_type.eq_ignore_ascii_case("tile");
-    let (sx, sy) = if tile { (0.75, 0.75) } else { (w / pw, h / ph) };
+    // A tile keeps the picture's natural size even when its pixmap was shrunk to the budget.
+    let (sx, sy) = if tile { (0.75 * nw / pw, 0.75 * nh / ph) } else { (w / pw, h / ph) };
     let extend = if tile { peniko::Extend::Repeat } else { peniko::Extend::Pad };
     ctx.set_transform(view);
     ctx.set_paint(vello_cpu::Image {
@@ -378,7 +426,11 @@ fn pixmap_for(doc: &Document, key: &str) -> Option<Arc<Pixmap>> {
     if let Some(v) = lock(images()).get(key, bytes) {
         return v;
     }
-    let pm = decode_pixmap(bytes).map(Arc::new);
+    // Shrink the picture so its pixmap and its source fit the cache together: kept there, it is not
+    // decoded again on every paint.
+    let room = (CACHE_BYTES.saturating_sub(bytes.len()) / 4) as u64;
+    let budget = room.clamp(MIN_PICTURE_PIXELS, MAX_PICTURE_PIXELS);
+    let pm = decode_rgba(bytes, MAX_DECODE_SIDE, budget).and_then(|img| premul_pixmap(img.width(), img.height(), img.as_raw())).map(Arc::new);
     let size = pm.as_ref().map_or(0, |p| p.width() as usize * p.height() as usize * 4);
     lock(images()).insert(key, bytes, pm.clone(), size);
     pm
@@ -485,17 +537,54 @@ impl Default for RenderOptions {
     }
 }
 
-/// Render a whole page at `scale` pixels per point.
+/// Most pixels one raster holds (64 Mpx, 256 MB of RGBA). A larger request is drawn at a lower
+/// resolution, both sides scaled alike, rather than allocating up to a gigabyte (WC-19).
+pub const MAX_RASTER_PIXELS: u64 = 64 * 1024 * 1024;
+
+/// Render a whole page at `scale` pixels per point, lowered so the raster stays within
+/// [`MAX_RASTER_PIXELS`] (a side past [`MAX_SIDE`] is still cut there).
 pub fn render_page(doc: &Document, page: &Page, scale: f32, opts: &RenderOptions) -> Rendered {
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let ph = page.h.min(1e6);
+    let scale = scale * area_fit(page.w as f64 * scale as f64, ph as f64 * scale as f64) as f32;
     let w = ((page.w * scale).ceil() as u32).clamp(1, MAX_SIDE);
-    let h = ((page.h.min(1e6) * scale).ceil() as u32).clamp(1, MAX_SIDE);
+    let h = ((ph * scale).ceil() as u32).clamp(1, MAX_SIDE);
     render_region(doc, page, w, h, Affine::scale(scale as f64), opts)
 }
 
-/// Render a page into a `w`×`h` raster with `view` (page points → pixels).
+/// The factor (at most 1) that brings a `w`×`h` pixel raster, cut to [`MAX_SIDE`] a side, within
+/// [`MAX_RASTER_PIXELS`]; 1 for a raster already within it or a degenerate size.
+fn area_fit(w: f64, h: f64) -> f64 {
+    let (max, side) = (MAX_RASTER_PIXELS as f64, MAX_SIDE as f64);
+    if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) || w.min(side) * h.min(side) <= max {
+        return 1.0;
+    }
+    let k = (max / (w * h)).sqrt();
+    if w * k <= side && h * k <= side {
+        return k;
+    }
+    // The long side still runs past MAX_SIDE (and is cut there): fit the short side against it.
+    (max / (w.min(h) * side)).min(1.0)
+}
+
+/// A raster size within [`MAX_SIDE`] a side and [`MAX_RASTER_PIXELS`] in all: `w`×`h` cut to the
+/// side limit, then scaled uniformly by the factor returned with it (1 when it already fits).
+fn raster_size(w: u32, h: u32) -> (u16, u16, f64) {
+    let (w, h) = (w.clamp(1, MAX_SIDE), h.clamp(1, MAX_SIDE));
+    let px = w as u64 * h as u64;
+    if px <= MAX_RASTER_PIXELS {
+        return (w as u16, h as u16, 1.0);
+    }
+    let k = (MAX_RASTER_PIXELS as f64 / px as f64).sqrt();
+    let side = |v: u32| ((v as f64 * k).floor() as u32).clamp(1, MAX_SIDE) as u16;
+    (side(w), side(h), k)
+}
+
+/// Render a page into a `w`×`h` raster with `view` (page points → pixels). A raster over
+/// [`MAX_RASTER_PIXELS`] is drawn smaller, `view` scaled to match.
 pub fn render_region(doc: &Document, page: &Page, w: u32, h: u32, view: Affine, opts: &RenderOptions) -> Rendered {
-    let (w16, h16) = (w.clamp(1, MAX_SIDE) as u16, h.clamp(1, MAX_SIDE) as u16);
+    let (w16, h16, k) = raster_size(w, h);
+    let view = if k < 1.0 { Affine::scale(k) * view } else { view };
     let mut ctx = RenderContext::new_with(w16, h16, vello_cpu::RenderSettings { num_threads: default_threads(), ..Default::default() });
     ctx.set_transform(Affine::IDENTITY);
     ctx.set_paint(color(opts.ink(doc.settings.page_color.unwrap_or(opts.paper)), 1.0));
@@ -1111,9 +1200,8 @@ pub fn render_area(doc: &Document, page: &Page, x: f32, y: f32, w: f32, h: f32, 
 /// at `scale` px/pt: no paper, no watermark. A dragged object's preview.
 pub fn render_items(doc: &Document, items: &[Draw], x: f32, y: f32, w: f32, h: f32, scale: f32, opts: &RenderOptions) -> Rendered {
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
-    let w16 = ((w * scale).ceil() as u32).clamp(1, MAX_SIDE) as u16;
-    let h16 = ((h * scale).ceil() as u32).clamp(1, MAX_SIDE) as u16;
-    let view = Affine::scale(scale as f64) * Affine::translate((-x as f64, -y as f64));
+    let (w16, h16, k) = raster_size((w * scale).ceil() as u32, (h * scale).ceil() as u32);
+    let view = Affine::scale(scale as f64 * k) * Affine::translate((-x as f64, -y as f64));
     let mut ctx = RenderContext::new_with(w16, h16, vello_cpu::RenderSettings { num_threads: 0, ..Default::default() });
     let visible = view.inverse().transform_rect_bbox(kurbo::Rect::new(0.0, 0.0, w16 as f64, h16 as f64)).inflate(40.0, 40.0);
     for it in items {
@@ -1339,7 +1427,69 @@ mod tests {
         assert_eq!(img.width, 612);
         let big = render_page(&d, &l.pages[0], 1e9, &RenderOptions::default());
         assert!(big.width <= MAX_SIDE);
+        assert!(big.width as u64 * big.height as u64 <= MAX_RASTER_PIXELS);
         assert!(decode_pixmap(b"not an image").is_none());
+    }
+
+    fn grey_png(w: u32, h: u32) -> Vec<u8> {
+        let mut png = Vec::new();
+        image::GrayImage::from_pixel(w, h, image::Luma([128])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        png
+    }
+
+    #[test]
+    fn wc19_oversized_pictures_shrink_to_the_budget_and_keep_their_shape() {
+        // Within the budget: the exact pixels, as before.
+        let img = decode_rgba(&grey_png(40, 10), MAX_DECODE_SIDE, 400).unwrap();
+        assert_eq!(img.dimensions(), (40, 10));
+        // Over it: scaled alike on both sides, still the same grey.
+        let img = decode_rgba(&grey_png(400, 100), MAX_DECODE_SIDE, 400).unwrap();
+        assert_eq!(img.dimensions(), (40, 10));
+        assert_eq!(img.get_pixel(20, 5).0, [128, 128, 128, 255]);
+        // A thin strip keeps at least a pixel a side.
+        assert_eq!(shrunk(10_000, 1, 100), (100, 1));
+        assert_eq!(shrunk(0, 0, 0), (1, 1));
+        assert!(decode_rgba(&grey_png(8, 8), 4, 400).is_none());
+    }
+
+    #[test]
+    fn wc19_a_large_picture_decodes_once_within_the_budget() {
+        // 30 Mpx of grey (a small PNG): over the picture budget, so it is shrunk and then cached
+        // rather than decoded again (at 120 MB) on every paint.
+        let mut d = Document::from_text("body");
+        let bytes = Arc::new(grey_png(6000, 5000));
+        d.media.insert("wc19-large.png".into(), bytes.clone());
+        let a = pixmap_for(&d, "wc19-large.png").unwrap();
+        assert!(a.width() as u64 * a.height() as u64 <= MAX_PICTURE_PIXELS);
+        let ratio = a.width() as f64 / a.height() as f64;
+        assert!((ratio - 1.2).abs() < 0.01, "{ratio}");
+        // Cached: the same pixmap comes back (unless a concurrent test cleared the shared cache).
+        let b = pixmap_for(&d, "wc19-large.png").unwrap();
+        assert!(Arc::ptr_eq(&a, &b) || lock(images()).get("wc19-large.png", &bytes).is_none());
+    }
+
+    #[test]
+    fn wc19_rasters_stay_within_the_area_budget() {
+        let d = Document::new();
+        let l = layout(&d, &mut LayoutCache::new(), &LayoutOptions::default());
+        // A 200" square page at 2 px/pt is 28800 px a side: drawn whole, at a lower resolution.
+        let mut page = l.pages[0].clone();
+        page.w = 14_400.0;
+        page.h = 14_400.0;
+        let img = render_page(&d, &page, 2.0, &RenderOptions::default());
+        assert!(img.width as u64 * img.height as u64 <= MAX_RASTER_PIXELS);
+        assert!(img.width > 8000 && img.width.abs_diff(img.height) <= 1, "{}×{}", img.width, img.height);
+        // A raster asked for directly is scaled alike on both sides.
+        let img = render_region(&d, &l.pages[0], MAX_SIDE, MAX_SIDE, Affine::IDENTITY, &RenderOptions::default());
+        assert!(img.width as u64 * img.height as u64 <= MAX_RASTER_PIXELS);
+        assert_eq!(img.width, img.height);
+        // A very long page keeps its width as far as the area allows (the length is cut at MAX_SIDE).
+        assert!((area_fit(612.0, 1e6) - 1.0).abs() < 1e-12);
+        let k = area_fit(20_000.0, 1e6);
+        assert!(k < 1.0 && (20_000.0 * k).min(MAX_SIDE as f64) * MAX_SIDE as f64 <= MAX_RASTER_PIXELS as f64 + 1.0);
+        assert_eq!(area_fit(f64::NAN, 10.0), 1.0);
+        // Normal pages are untouched.
+        assert_eq!(render_page(&d, &l.pages[0], 2.0, &RenderOptions::default()).width, 1224);
     }
 
     #[test]

@@ -56,6 +56,11 @@ use wordcraft_metafile::{Picture, PlacedItem};
 const MAX_SIDE: f32 = 14_400.0;
 /// Largest picture side we embed (pixels).
 const MAX_IMAGE_SIDE: u32 = 30_000;
+/// Most pixels a picture is embedded with (64 Mpx, 256 MB of RGBA while it is compressed); a larger
+/// one is shrunk to fit.
+const MAX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
+/// Most bytes a picture's decoder may allocate (the 512 MB `load_from_memory` applied).
+const MAX_DECODE_ALLOC: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PdfError {
@@ -1676,26 +1681,60 @@ fn path_from(b: &kurbo::BezPath) -> Option<Path> {
 }
 
 /// Decode a picture for embedding (validated with the `image` crate first, so a broken file
-/// can't fail the whole export).
+/// can't fail the whole export), shrunk to at most [`MAX_IMAGE_PIXELS`].
 fn load_image(data: &Arc<Vec<u8>>) -> Option<Image> {
+    load_image_within(data, MAX_IMAGE_PIXELS)
+}
+
+/// [`load_image`] with a pixel budget: a larger picture is shrunk uniformly (averaging) to fit, so
+/// it still shows. The header is read first: a side over [`MAX_IMAGE_SIDE`] is refused before
+/// decoding, and the decoder may allocate only what an image of the declared size needs (up to 16
+/// bytes a pixel, float RGBA, plus room for metadata), never past [`MAX_DECODE_ALLOC`]. krilla
+/// compresses the RGBA as the image is made (it is built without threads) and drops it, so the
+/// export keeps only the compressed streams, not every decoded picture (WC-19).
+fn load_image_within(data: &Arc<Vec<u8>>, max_pixels: u64) -> Option<Image> {
     let fmt = image::guess_format(data).ok()?;
-    // The side check below used to run only after a full decode; applying it as a decode limit
-    // rejects a small file that declares a huge image at header time instead. The default
-    // allocation cap (512 MB, what `load_from_memory_with_format` applied) stays in force.
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(data.as_slice())).with_guessed_format().ok()?.into_dimensions().ok()?;
+    if w == 0 || h == 0 || w > MAX_IMAGE_SIDE || h > MAX_IMAGE_SIDE {
+        return None;
+    }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(data.as_slice())).with_guessed_format().ok()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_SIDE);
     limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    let need = (w as u64 * h as u64).saturating_mul(16).saturating_add(16 * 1024 * 1024);
+    limits.max_alloc = Some(need.min(MAX_DECODE_ALLOC));
     reader.limits(limits);
     let dec = reader.decode().ok()?;
     let (w, h) = (dec.width(), dec.height());
     if w == 0 || h == 0 || w > MAX_IMAGE_SIDE || h > MAX_IMAGE_SIDE {
         return None;
     }
+    if w as u64 * h as u64 > max_pixels.max(1) {
+        let (sw, sh) = shrunk(w, h, max_pixels);
+        let small = dec.thumbnail_exact(sw, sh);
+        drop(dec);
+        return Some(Image::from_rgba8(small.into_rgba8().into_raw(), sw, sh));
+    }
     if fmt == image::ImageFormat::Jpeg && matches!(dec.color(), image::ColorType::L8 | image::ColorType::Rgb8) {
         return Image::from_jpeg(data.clone().into(), true).ok();
     }
-    Some(Image::from_rgba8(dec.to_rgba8().into_raw(), w, h))
+    Some(Image::from_rgba8(dec.into_rgba8().into_raw(), w, h))
+}
+
+/// `w`×`h` scaled uniformly (rounding down) to at most `max_pixels`; a side that would round to
+/// nothing keeps 1 pixel, and the other side then takes the whole budget.
+fn shrunk(w: u32, h: u32, max_pixels: u64) -> (u32, u32) {
+    let max = max_pixels.max(1);
+    let k = (max as f64 / (w as u64 * h as u64).max(1) as f64).sqrt().min(1.0);
+    let side = |v: u32| ((v as f64 * k).floor() as u32).clamp(1, v.max(1));
+    let (sw, sh) = (side(w), side(h));
+    let cap = |v: u32| max.min(v as u64) as u32;
+    match (sw, sh) {
+        (1, _) => (1, cap(sh)),
+        (_, 1) => (cap(sw), 1),
+        _ => (sw, sh),
+    }
 }
 
 #[cfg(test)]
