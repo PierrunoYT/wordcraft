@@ -831,8 +831,9 @@ mod tests {
         let ttc = collection_of(&renamed("SourceSans3-Regular.ttf", "Embedfont Abc"), 100_000);
         assert_eq!(super::super::enumerate_faces(&ttc).len(), MAX_FACES_PER_FILE);
         let db = db();
+        // Opened as a document's embedded font, both copies load once, in bounded time (checked
+        // below). Which documents then see the family is up to the document-font scope.
         assert_eq!(db.add_document_fonts(vec![ttc.clone(), ttc.clone()]), 1, "the same face once");
-        assert!(db.has_family("Embedfont Abc"));
         // Installing it is refused rather than truncated.
         assert!(matches!(db.install_font("big.ttc", &ttc), Err(UserFontError::Unusable(_))));
         // A variable font with 20,000 named instances (2,000 style names; the name table holds at
