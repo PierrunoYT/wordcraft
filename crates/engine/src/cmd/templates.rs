@@ -90,8 +90,18 @@ fn attach(s: &mut Session, v: &Value) -> CmdResult {
 /// styles of the same name.
 fn update_styles(s: &mut Session, v: &Value) -> CmdResult {
     let attached = s.doc.settings.attached_template.clone();
-    let path = p::str(v, "path").map(str::to_string).or(attached).ok_or_else(|| CmdError::Params("no template is attached; give `path`".into()))?;
+    let explicit = p::str(v, "path").map(str::to_string);
+    let from_document = explicit.is_none();
+    let path = explicit.or(attached).ok_or_else(|| CmdError::Params("no template is attached; give `path`".into()))?;
     let base = s.path.clone();
+    // The attached template's path comes from the document: never read it from another machine
+    // or a device, however it is spelled (`local_path` alone lets `\??\UNC\host\…` through).
+    if from_document
+        && p::str(v, "data").is_none()
+        && (is_remote_or_device(&path) || local_path(&path, base.as_deref()).is_some_and(|l| is_remote_or_device(&l.to_string_lossy())))
+    {
+        return Err(CmdError::Failed(format!("the attached template `{path}` is not on this computer; give `path`")));
+    }
     let src = load_other(&path, p::str(v, "data"), base.as_deref())?;
     let report = apply_template_styles(&mut s.doc, &src);
     touch_all(s);
@@ -243,6 +253,15 @@ pub fn local_path(target: &str, base: Option<&Path>) -> Option<PathBuf> {
 fn is_network_path(p: &str) -> bool {
     let b = p.as_bytes();
     matches!((b.first(), b.get(1)), (Some(b'\\' | b'/'), Some(b'\\' | b'/')))
+}
+
+/// A path to another machine or a Windows device namespace, either slash: `\\host\share`,
+/// `//host/share`, `\\?\UNC\host\share`, `\\.\device` (all `\\…`) and the NT `\??\…` prefix.
+/// Overlaps `file_access::is_network_or_device_path` from PR #2805; one can replace the other
+/// once both are in.
+fn is_remote_or_device(p: &str) -> bool {
+    let head: Vec<u8> = p.trim().bytes().take(4).map(|c| if c == b'/' { b'\\' } else { c }).collect();
+    head.starts_with(br"\\") || head.starts_with(br"\??\")
 }
 
 fn is_windows_absolute(p: &str) -> bool {
@@ -509,5 +528,35 @@ mod tests {
         }
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz%4"), "%zz%4");
+    }
+
+    /// Audit minor (attached templates): `tools.updateStyles` without a `path` never follows the
+    /// document's attached template to another machine or a device, however it is spelled.
+    #[test]
+    fn update_styles_refuses_a_remote_or_device_attached_template() {
+        for remote in [
+            r"\\evil.example\share\T.dotx",
+            "//evil.example/share/T.dotx",
+            r"\\?\UNC\evil.example\share\T.dotx",
+            r"\??\UNC\evil.example\share\T.dotx",
+            "/??/UNC/evil.example/share/T.dotx",
+            r"\\.\pipe\T.dotx",
+            r" \??\C:\T.dotx",
+            "file:///%5C%3F%3F%5CUNC%5Cevil.example%5Cshare%5CT.dotx",
+        ] {
+            let mut s = Session::new(Document::new());
+            s.doc.settings.attached_template = Some(remote.into());
+            let err = s.run("tools.updateStyles", &json!({})).unwrap_err().to_string();
+            assert!(err.contains("not on this computer") || err.contains("not a local file"), "{remote}: {err}");
+            assert!(!s.dirty, "{remote}");
+        }
+        for local in [r"C:\Templates\T.dotx", "/home/a/T.dotx", "T.dotx", r"\Templates\T.dotx", "?\\T.dotx"] {
+            assert!(!is_remote_or_device(local), "{local}");
+        }
+        // Given explicitly, or as bytes, the path is the caller's: the usual rules apply.
+        let mut s = Session::new(Document::new());
+        s.doc.settings.attached_template = Some(r"\??\UNC\evil.example\share\T.dotx".into());
+        let err = s.run("tools.updateStyles", &json!({"data": "AAAA"})).unwrap_err().to_string();
+        assert!(!err.contains("not on this computer"), "{err}");
     }
 }
