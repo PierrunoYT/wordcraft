@@ -462,8 +462,9 @@ mod tests {
             ("../evil.txt".into(), b"x".to_vec()),
         ])
         .unwrap();
-        let back = zip::ZipArchive::new(Cursor::new(out)).unwrap();
-        assert_eq!(back.file_names().collect::<Vec<_>>(), ["word/document.xml"]);
+        let mut back = zip::ZipArchive::new(Cursor::new(out)).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back.by_index_raw(0).unwrap().name_raw(), b"word/document.xml");
     }
 
     #[test]
