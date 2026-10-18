@@ -21,7 +21,18 @@ impl Session {
     /// Headless sessions and the browser never write recovery files implicitly.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn enable_recovery(&mut self, root: std::path::PathBuf, wake: std::sync::Arc<dyn Fn() + Send + Sync>) -> Result<(), String> {
-        self.recovery = Some(Recovery::start(root, wake)?);
+        self.enable_recovery_every(root, wake, desktop::INTERVAL)
+    }
+    /// [`Self::enable_recovery`], copying a changed document every `interval` (at most a day)
+    /// instead of every 10 s. Tests pick a long one, so no copy is written mid-test.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn enable_recovery_every(
+        &mut self,
+        root: std::path::PathBuf,
+        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+        interval: std::time::Duration,
+    ) -> Result<(), String> {
+        self.recovery = Some(Recovery::start(root, wake, interval)?);
         Ok(())
     }
     pub fn recovery_documents(&self) -> Vec<RecoveryInfo> {

@@ -9,7 +9,10 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use wordcraft_doc::Document;
 
-const INTERVAL: Duration = Duration::from_secs(10);
+/// How often a changed document is copied for recovery (by default).
+pub(crate) const INTERVAL: Duration = Duration::from_secs(10);
+/// The longest copy interval a host may ask for.
+const MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BYTES: u64 = 256 << 20;
 const MAX_RECORDS: usize = 128;
 const MAX_FILES: usize = 16;
@@ -369,10 +372,19 @@ pub(crate) struct Recovery {
     id: Option<String>,
     revision: Option<u64>,
     due: Instant,
+    /// How often a changed document is copied ([`INTERVAL`] unless the host chose another).
+    interval: Duration,
     alive: bool,
 }
+
+/// `from` plus `d`, or `from` if that is past what `Instant` can hold.
+fn later(from: Instant, d: Duration) -> Instant {
+    from.checked_add(d).unwrap_or(from)
+}
+
 impl Recovery {
-    pub fn start(root: PathBuf, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
+    pub fn start(root: PathBuf, wake: Arc<dyn Fn() + Send + Sync>, interval: Duration) -> Result<Self, String> {
+        let interval = interval.min(MAX_INTERVAL);
         let (tx, jobs) = mpsc::sync_channel(1);
         let (events, rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -415,7 +427,8 @@ impl Recovery {
             document: None,
             id: None,
             revision: None,
-            due: Instant::now() + INTERVAL,
+            due: later(Instant::now(), interval),
+            interval,
             alive: true,
         })
     }
@@ -449,7 +462,7 @@ impl Recovery {
                     Err(e) => {
                         self.error = Some(e);
                         self.revision = None;
-                        self.due = Instant::now() + INTERVAL;
+                        self.due = later(Instant::now(), self.interval);
                         None
                     }
                 }
@@ -469,7 +482,7 @@ impl Recovery {
         self.id = Some(id);
         self.document = Some(document);
         self.revision = Some(revision);
-        self.due = Instant::now() + INTERVAL;
+        self.due = later(Instant::now(), self.interval);
     }
     pub fn tick(&mut self, s: &Session, now: Instant) -> Result<(), String> {
         if self.document != Some(s.document_id()) {
@@ -498,7 +511,7 @@ impl Recovery {
         self.queue(Job::Save(Box::new(Snapshot { version: 1, info, generation: 0, document: s.doc.clone() })))?;
         self.id = Some(id);
         self.revision = Some(s.rev());
-        self.due = now + INTERVAL;
+        self.due = later(now, self.interval);
         Ok(())
     }
     pub fn document_is(&self, document: u64) -> bool {
@@ -626,6 +639,34 @@ mod tests {
         s.recovery.as_mut().unwrap().due = Instant::now();
         s.recovery_tick();
         settle(s);
+    }
+
+    #[test]
+    fn the_host_chooses_the_copy_interval() {
+        // An hour: an edited document is not copied on the next ticks (a UI test that outlasts
+        // the default 10 s gets no copy mid-test). A huge interval is capped, not overflowed.
+        let t = Temp::new();
+        let mut s = Session::new(Document::new());
+        s.enable_recovery_every(t.0.clone(), Arc::new(|| {}), Duration::from_secs(3600)).unwrap();
+        settle(&mut s);
+        s.run("document.setText", &json!({"text": "Synthetic edit"})).unwrap();
+        s.recovery_tick();
+        assert!(!s.recovery_busy() && s.recovery_documents().is_empty());
+        assert_eq!(s.recovery.as_ref().unwrap().interval, Duration::from_secs(3600));
+        // No interval at all: the next tick copies it.
+        let u = Temp::new();
+        let mut s = Session::new(Document::new());
+        s.enable_recovery_every(u.0.clone(), Arc::new(|| {}), Duration::ZERO).unwrap();
+        settle(&mut s);
+        s.run("document.setText", &json!({"text": "Synthetic edit"})).unwrap();
+        s.recovery_tick();
+        settle(&mut s);
+        assert_eq!(s.recovery_documents().len(), 1);
+        let v = Temp::new();
+        let mut s = Session::new(Document::new());
+        s.enable_recovery_every(v.0.clone(), Arc::new(|| {}), Duration::MAX).unwrap();
+        assert_eq!(s.recovery.as_ref().unwrap().interval, MAX_INTERVAL);
+        settle(&mut s);
     }
 
     #[test]

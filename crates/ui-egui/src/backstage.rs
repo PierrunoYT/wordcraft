@@ -507,7 +507,10 @@ mod tests {
         )
         .unwrap();
         let mut app = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Services::default());
-        app.session.enable_recovery(root.clone(), std::sync::Arc::new(|| {})).unwrap();
+        // No timed copy of the edited document mid-test: under load a test can outlast the 10 s
+        // interval, and the copy kept the worker busy (Restore disabled) or listed a second draft.
+        let hour = std::time::Duration::from_secs(3600);
+        app.session.enable_recovery_every(root.clone(), std::sync::Arc::new(|| {}), hour).unwrap();
         (app, root)
     }
 
@@ -525,13 +528,20 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn settle_recovery(h: &mut egui_kittest::Harness<'_, WordApp>) {
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        step_until(h, "the recovery worker", |app| app.session.recovery_ready() && !app.session.recovery_busy());
+    }
+
+    /// Run frames until `done` holds (worker results land between frames), failing after a
+    /// deadline generous enough for a loaded machine.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn step_until(h: &mut egui_kittest::Harness<'_, WordApp>, what: &str, done: impl Fn(&WordApp) -> bool) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             h.run_steps(2);
-            if h.state().session.recovery_ready() && !h.state().session.recovery_busy() {
+            if done(h.state()) {
                 break;
             }
-            assert!(std::time::Instant::now() < end);
+            assert!(std::time::Instant::now() < end, "timed out waiting for {what}");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         // Worker completion is a state boundary; egui needs subsequent frames to finish
@@ -579,16 +589,19 @@ mod tests {
         h.state_mut().run("file.recover", json!({})).unwrap();
         h.run_steps(4);
         assert_eq!(h.state().session.recovery_documents().len(), 1);
+        let asks = |app: &WordApp| matches!(app.dialog, Some(crate::dialogs::Dialog::SaveChanges { .. }));
         h.get_by_label("Restore").click();
-        h.run_steps(4);
-        assert!(matches!(h.state().dialog, Some(crate::dialogs::Dialog::SaveChanges { .. })));
+        step_until(&mut h, "the Save Changes prompt", asks);
         h.get_by_label("Cancel").click();
-        h.run_steps(4);
+        step_until(&mut h, "the prompt to close", |app| app.dialog.is_none());
         assert_eq!(h.state().session.doc.plain_text(wordcraft_doc::StoryRef::Body), "Current unsaved work");
         h.get_by_label("Restore").click();
-        h.run_steps(4);
+        step_until(&mut h, "the Save Changes prompt", asks);
         h.get_by_label("Don't Save").click();
-        settle_recovery(&mut h);
+        // The copy loads on the recovery worker: wait for it to replace the document.
+        step_until(&mut h, "the restored copy", |app| {
+            !app.session.recovery_busy() && app.session.doc.plain_text(wordcraft_doc::StoryRef::Body) == "Recovered synthetic work"
+        });
         assert_eq!(h.state().session.doc.plain_text(wordcraft_doc::StoryRef::Body), "Recovered synthetic work");
         assert!(h.state().session.dirty && h.state().session.path.is_none());
         assert!(h.state().autosave_path.is_none());
