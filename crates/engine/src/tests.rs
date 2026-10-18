@@ -5459,7 +5459,8 @@ const PORTUGUESE_TEST_DIC: &str = "11\nsaudade\ncoração\ne\nele\ndisse\nnão\n
 fn dictionaries_folder_option_is_saved_searched_and_reported() {
     let dir = std::env::temp_dir().join(format!("wc-engine-dictionaries-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // Setting the folder reloads every language's dictionary, Italian included.
+    // Setting the folder drops every loaded Hunspell dictionary (Italian too), so each language a
+    // test installs must be in it, or a test running meanwhile loses its words.
     for (name, aff, dic) in [
         ("pl_PL", POLISH_TEST_AFF, POLISH_TEST_DIC),
         ("pt_BR", PORTUGUESE_TEST_AFF, PORTUGUESE_TEST_DIC),
