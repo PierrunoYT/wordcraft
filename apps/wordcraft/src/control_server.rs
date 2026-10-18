@@ -2,8 +2,8 @@
 //! This is the transport the MCP server (`wordcraft-cli mcp --connect`) wraps.
 //!
 //! Every request needs the window's key (`docs/control-protocol.md`, Keys): once the port is
-//! bound, the app writes a random key to `<settings>/control-key.<instance>` (mode 0600) and
-//! removes the file when the window closes.
+//! bound, the app writes a random key to `<settings>/control-key.<instance>` (mode 0600 on Unix,
+//! an owner-only ACL on Windows) and removes the file when the window closes.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -42,6 +42,18 @@ impl KeyFile {
 /// cannot be bound or there is no random key (the control channel is off); the key file is
 /// `None` when it could not be written (requests are then refused).
 pub fn start(port: u16, ctx: egui::Context, settings: Option<&Path>) -> Option<(Receiver<ControlRequest>, Option<KeyFile>)> {
+    start_with(port, ctx, settings, wordcraft_control_key::make_private)
+}
+
+/// [`start`], with `restrict` making the new key file private (tests pass one that spawns no
+/// process: a child started while a connection is open inherits its socket on Windows, and
+/// resets the connection when it exits).
+fn start_with(
+    port: u16,
+    ctx: egui::Context,
+    settings: Option<&Path>,
+    restrict: fn(&Path) -> Result<(), String>,
+) -> Option<(Receiver<ControlRequest>, Option<KeyFile>)> {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -59,8 +71,15 @@ pub fn start(port: u16, ctx: egui::Context, settings: Option<&Path>) -> Option<(
     let key_file = match settings {
         Some(dir) => {
             let p = wordcraft_control_key::key_path(dir, port);
-            match write_key_file(&p, &key) {
-                Ok(()) => Some(KeyFile(p)),
+            // A folder named by WORDCRAFT_PROFILE_DIR may be shared: no key there unless it's private.
+            let strict = std::env::var_os("WORDCRAFT_PROFILE_DIR").is_some_and(|d| !d.is_empty());
+            match wordcraft_control_key::write_key_file_with(&p, &key, strict, restrict) {
+                Ok(warning) => {
+                    if let Some(w) = warning {
+                        log::warn!("{w}");
+                    }
+                    Some(KeyFile(p))
+                }
                 Err(e) => {
                     log::error!("control key file not written ({e}): requests will be refused");
                     None
@@ -84,21 +103,6 @@ fn random_key() -> Result<String, String> {
     let mut b = [0u8; 32];
     getrandom::fill(&mut b).map_err(|e| e.to_string())?;
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
-}
-
-/// Write the key file: a stale one (from a run that did not exit cleanly) is replaced; on Unix
-/// the new file is created with mode 0600.
-fn write_key_file(p: &Path, key: &str) -> Result<(), String> {
-    if let Some(d) = p.parent() {
-        std::fs::create_dir_all(d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
-    }
-    let _ = std::fs::remove_file(p);
-    let mut open = std::fs::OpenOptions::new();
-    open.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
-    let mut f = open.open(p).map_err(|e| format!("cannot create {}: {e}", p.display()))?;
-    f.write_all(key.as_bytes()).map_err(|e| format!("cannot write {}: {e}", p.display()))
 }
 
 /// Compare a key with the window's in time that does not depend on where they differ. An
@@ -565,7 +569,8 @@ mod tests {
         let mut free_port = port.wrapping_add(1).max(1024);
         let mut started = None;
         for _ in 0..100 {
-            if let Some(res) = start(free_port, egui::Context::default(), Some(&dir)) {
+            // No ACL tools here (see `start_with`); the control-key crate tests them.
+            if let Some(res) = start_with(free_port, egui::Context::default(), Some(&dir), |_| Ok(())) {
                 started = Some((res, free_port));
                 break;
             }
@@ -587,27 +592,6 @@ mod tests {
         assert_eq!(c.recv()["ok"], true);
         key_file.remove();
         assert!(!key_file.path().exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_stale_key_file_is_replaced() {
-        let dir = temp_dir("stale");
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("control-key.test");
-        std::fs::write(&p, "old").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        write_key_file(&p, KEY).unwrap();
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), KEY);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

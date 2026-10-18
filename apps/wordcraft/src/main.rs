@@ -4,8 +4,8 @@
 //!
 //! `--control <port>` (or `WORDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server:
 //! `{"id":1,"key":"…","method":"engine.execute","params":{"command":"text.insert","params":{"text":"Hi"}}}`.
-//! Every request needs the key the app writes to `<settings>/control-key.<instance>` (mode 0600,
-//! removed on exit). See `docs/control-protocol.md`.
+//! Every request needs the key the app writes to `<settings>/control-key.<instance>` (owner
+//! only: mode 0600 on Unix, a one-entry ACL on Windows; removed on exit). See `docs/control-protocol.md`.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 

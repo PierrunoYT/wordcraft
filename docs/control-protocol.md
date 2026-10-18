@@ -23,7 +23,20 @@ writes a new key. `WORDCRAFT_PROFILE_DIR` overrides the whole profile folder for
 including recovery copies. See [local recovery](recovery.md). `<settings>` is the folder that holds the preferences: on Linux
 `$XDG_CONFIG_HOME/wordcraft` (by default `~/.config/wordcraft`), on macOS
 `~/Library/Application Support/WordCraft`, on Windows `%APPDATA%\WordCraft`. `<instance>` is the
-Flatpak instance id inside Flatpak, and `local-<port>` otherwise. On Unix the file has mode 0600.
+Flatpak instance id inside Flatpak, and `local-<port>` otherwise.
+
+Only your account can read the key file:
+
+- On Unix the file has mode 0600.
+- On Windows it gets an ACL with one entry: full control for your account, named by its SID.
+  The entries it would inherit from the folder, and any added when it was created, are removed,
+  so SYSTEM, Administrators and other users get no access (an administrator can still take
+  ownership). The app sets this before it writes the key, by running `whoami.exe /user` and
+  `icacls.exe` (`/reset`, then `/inheritance:r /grant:r *<SID>:F`) from
+  `%SystemRoot%\System32`. While it does, no other process can open the file. If the ACL can't be
+  set, the app warns in its log and writes the key anyway when the file is in the default
+  `%APPDATA%\WordCraft` folder, which is already yours alone. Under `WORDCRAFT_PROFILE_DIR`, which
+  may be a shared folder, it removes the file and writes no key, so requests are refused.
 
 ```sh
 cat ~/.config/wordcraft/control-key.local-7981   # Linux, outside Flatpak, port 7981
