@@ -305,7 +305,7 @@ fn font(s: &mut Session, v: &Value) -> CmdResult {
     // Word; choosing a Latin font leaves that text's font as it was.
     let ea = east_asia.or_else(|| {
         name.clone().filter(|n| {
-            let r = wordcraft_fonts::word::resolve(n, false, false);
+            let r = wordcraft_fonts::word::resolve_in(s.doc.font_scope, n, false, false);
             !r.substituted && r.face.is_east_asian()
         })
     });

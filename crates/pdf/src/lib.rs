@@ -1528,7 +1528,7 @@ impl Exporter<'_> {
     }
 
     fn watermark(&mut self, s: &mut Surface, wm: &wordcraft_doc::Watermark, w: f32, h: f32) {
-        let r = wordcraft_fonts::word::resolve(&wm.font, false, false);
+        let r = wordcraft_fonts::word::resolve_in(self.doc.font_scope, &wm.font, false, false);
         let face = r.face;
         let text: String = wm.text.chars().take(200).collect();
         let shaped = wordcraft_fonts::shape(&face, &text, &[], |c| c);

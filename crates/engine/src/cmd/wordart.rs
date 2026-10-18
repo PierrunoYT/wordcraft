@@ -255,7 +255,7 @@ fn transform(s: &mut Session, v: &Value) -> CmdResult {
 /// How wide `text` is at `size` points in the document's body font, points.
 fn text_width(s: &Session, text: &str, size: f32, bold: bool) -> f32 {
     let family = s.doc.styles.default_chr.font.clone().unwrap_or_else(|| s.doc.settings.minor_font.clone());
-    let face = wordcraft_fonts::word::resolve(&family, bold, false).face;
+    let face = wordcraft_fonts::word::resolve_in(s.doc.font_scope, &family, bold, false).face;
     let k = size / face.upem.max(1.0) as f32;
     wordcraft_fonts::shape(&face, text, &[], |c| c).iter().map(|g| g.x_advance as f32 * k).sum::<f32>()
 }

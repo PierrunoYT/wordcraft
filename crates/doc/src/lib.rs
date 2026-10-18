@@ -682,6 +682,12 @@ pub struct Document {
     /// Source-format parts we keep verbatim for round-trip (e.g. custom XML), by part name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub passthrough: BTreeMap<String, Arc<Vec<u8>>>,
+    /// The fonts the document embeds, as loaded for its own layout when it was opened: a scope in
+    /// the font database's document fonts (0 = none). Only this document's text resolves to them,
+    /// so one document's fonts never draw another's text. Derived from the font parts in
+    /// [`Document::passthrough`] when opened, never saved.
+    #[serde(skip)]
+    pub font_scope: u32,
 }
 
 impl Default for Document {
@@ -709,6 +715,7 @@ impl Document {
             endnote_separators: NoteSeparators::default(),
             media: BTreeMap::new(),
             passthrough: BTreeMap::new(),
+            font_scope: 0,
         }
     }
 

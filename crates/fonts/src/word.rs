@@ -210,14 +210,21 @@ fn style_name(bold: bool, italic: bool) -> &'static str {
 }
 
 /// Resolve `family` with bold/italic to a face (memoised until user fonts are added or removed,
-/// [`FontDb::generation`]).
+/// [`FontDb::generation`]). Fonts documents embed aren't seen: a document's text resolves through
+/// [`resolve_in`] with its font scope.
 pub fn resolve(family: &str, bold: bool, italic: bool) -> Resolved {
-    type Memo = (u64, HashMap<(String, bool, bool), Resolved>);
+    resolve_in(0, family, bold, italic)
+}
+
+/// [`resolve`] for a document whose font scope (`Document::font_scope`) is `scope`: the fonts it
+/// embeds count as available too ([`FontDb::face_in`]). Scope 0 is [`resolve`].
+pub fn resolve_in(scope: u32, family: &str, bold: bool, italic: bool) -> Resolved {
+    type Memo = (u64, HashMap<(u32, String, bool, bool), Resolved>);
     static CACHE: OnceLock<Mutex<Memo>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new((0, HashMap::new())));
     let db = FontDb::global();
     let generation = db.generation();
-    let key = (family.to_string(), bold, italic);
+    let key = (scope, family.to_string(), bold, italic);
     {
         let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
         if c.0 != generation {
@@ -228,16 +235,16 @@ pub fn resolve(family: &str, bold: bool, italic: bool) -> Resolved {
         }
     }
     let base = charset_base_family(family);
-    let (fam, substituted) = if db.has_family(family) {
+    let (fam, substituted) = if db.has_family_in(scope, family) {
         (family.to_string(), false)
-    } else if base != family && db.has_family(base) {
+    } else if base != family && db.has_family_in(scope, base) {
         // Windows maps the charset names to the font itself: not a substitution.
         (base.to_string(), false)
     } else {
-        let s = substitutes(base).iter().find(|s| db.has_family(s)).copied().unwrap_or(crate::FALLBACK_FAMILY);
+        let s = substitutes(base).iter().find(|s| db.has_family_in(scope, s)).copied().unwrap_or(crate::FALLBACK_FAMILY);
         (s.to_string(), true)
     };
-    let face = db.face(&fam, style_name(bold, italic));
+    let face = db.face_in(scope, &fam, style_name(bold, italic));
     let r = Resolved { synth_bold: bold && face.weight < 600.0, synth_italic: italic && !face.italic, substituted, face: FaceRef::of(&face) };
     let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
     if c.0 == generation {

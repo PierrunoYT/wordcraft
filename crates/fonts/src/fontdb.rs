@@ -12,6 +12,7 @@ use skrifa::raw::FileRef;
 use skrifa::string::StringId;
 use skrifa::{GlyphId, MetadataProvider};
 
+mod document;
 mod user;
 pub use user::{FONT_FILE_EXTS, FontFormat, Installed, MAX_FONT_FILE_BYTES, UserFont, UserFontError, decode_font_file, is_font_file_name, sniff};
 
@@ -310,6 +311,8 @@ pub struct FontDb {
     catalog: RwLock<Vec<CatalogEntry>>,
     /// Fonts the user added at run time, and the folder they are stored in (#582).
     user: RwLock<user::UserFonts>,
+    /// The fonts documents embed, each resolved only for the documents that embed it.
+    documents: RwLock<document::DocumentFonts>,
     /// Bumped whenever user fonts are added or removed ([`FontDb::generation`]).
     generation: AtomicU64,
     /// The folders the system font scan reads (the platform's font folders for [`FontDb::global`]).
@@ -887,6 +890,32 @@ fn style_italic(style: &str) -> bool {
     s.contains("italic") || s.contains("oblique") || s == "it"
 }
 
+/// The face of `faces` that `family` (a typographic family, else a legacy family name) and
+/// `style` resolve to: the style itself, else the closest weight of the same slant.
+fn closest(faces: &[Arc<FontFace>], family: &str, style: &str) -> Option<Arc<FontFace>> {
+    let mut cands: Vec<&Arc<FontFace>> = faces.iter().filter(|f| f.family.eq_ignore_ascii_case(family)).collect();
+    if cands.is_empty() {
+        // A legacy family name: choose among the faces it names (bold and italic as usual).
+        cands = faces.iter().filter(|f| f.legacy_family.eq_ignore_ascii_case(family)).collect();
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    let ns = norm(style);
+    if let Some(f) = cands.iter().find(|f| norm(&f.style) == ns) {
+        return Some((*f).clone());
+    }
+    let (tw, ti) = (style_weight(style), style_italic(style));
+    cands
+        .iter()
+        .min_by(|a, b| {
+            let sa = (a.weight - tw).abs() + if a.italic != ti { 1000.0 } else { 0.0 };
+            let sb = (b.weight - tw).abs() + if b.italic != ti { 1000.0 } else { 0.0 };
+            sa.total_cmp(&sb)
+        })
+        .map(|f| (*f).clone())
+}
+
 impl FontDb {
     /// A database holding the bundled fonts, then the craft-fonts Japanese faces (Mincho first,
     /// so they are the fallback for Japanese text after the requested and bundled fonts), then the
@@ -913,6 +942,7 @@ impl FontDb {
             #[cfg(not(target_arch = "wasm32"))]
             catalog: RwLock::new(Vec::new()),
             user: RwLock::new(user::UserFonts::default()),
+            documents: RwLock::new(document::DocumentFonts::default()),
             generation: AtomicU64::new(0),
             font_dirs,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1368,28 +1398,7 @@ impl FontDb {
             }
             return self.instance(family, style);
         }
-        let faces = self.read_faces();
-        let mut cands: Vec<&Arc<FontFace>> = faces.iter().filter(|f| f.family.eq_ignore_ascii_case(family)).collect();
-        if cands.is_empty() {
-            // A legacy family name: choose among the faces it names (bold and italic as usual).
-            cands = faces.iter().filter(|f| f.legacy_family.eq_ignore_ascii_case(family)).collect();
-        }
-        if cands.is_empty() {
-            return None;
-        }
-        let ns = norm(style);
-        if let Some(f) = cands.iter().find(|f| norm(&f.style) == ns) {
-            return Some((*f).clone());
-        }
-        let (tw, ti) = (style_weight(style), style_italic(style));
-        cands
-            .iter()
-            .min_by(|a, b| {
-                let sa = (a.weight - tw).abs() + if a.italic != ti { 1000.0 } else { 0.0 };
-                let sb = (b.weight - tw).abs() + if b.italic != ti { 1000.0 } else { 0.0 };
-                sa.total_cmp(&sb)
-            })
-            .map(|f| (*f).clone())
+        closest(&self.read_faces(), family, style)
     }
 
     /// First face (fallback family first, then load order) that covers `c`; on native, system

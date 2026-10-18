@@ -174,3 +174,43 @@ fn fonts_embedded_in_a_docx_lay_out_its_text() {
         assert!((x - mono).abs() < 0.01, "{family}: measured with the embedded font: {x} vs {mono} (missing {missing})");
     }
 }
+
+#[test]
+fn a_font_one_document_embeds_never_draws_another_documents_text() {
+    // WC-40: embedded fonts used to join the process-wide font list, so document A's font drew
+    // (or impersonated) text in any document opened after it that asked for the same name.
+    const TEXT: &str = "illicit little lilies fill tiny jill";
+    const FAMILY: &str = "JetBrains Scop";
+    let end_x = |doc: wordcraft_doc::Document| Session::new(doc).layout().caret_on(&Pos::body(0, TEXT.len()), 0).unwrap().x;
+    let mono = end_x(crate::io::open_bytes("m.docx", &docx_embedding("JetBrains Mono", None, TEXT)).unwrap());
+    let font = renamed("JetBrainsMono-Regular.ttf", "JetBrains Mono", FAMILY);
+    let a_bytes = docx_embedding(FAMILY, Some((&font, "{9F1C2A4E-7B3D-4C58-A1E6-0D2B8F5C3E78}")), TEXT);
+    let a = crate::io::open_bytes("a.docx", &a_bytes).unwrap();
+    assert_ne!(a.font_scope, 0);
+    assert!((end_x(a.clone()) - mono).abs() < 0.01, "A lays out with its own font");
+    // B asks for the same family without embedding it: it falls back, as if A had never opened.
+    let b = crate::io::open_bytes("b.docx", &docx_embedding(FAMILY, None, TEXT)).unwrap();
+    assert_eq!(b.font_scope, 0);
+    let missing = end_x(b.clone());
+    assert!((missing - mono).abs() > 1.0, "B falls back: {missing} vs {mono}");
+    assert!(wordcraft_fonts::word::resolve_in(b.font_scope, FAMILY, false, false).substituted);
+    assert!(wordcraft_fonts::word::resolve(FAMILY, false, false).substituted);
+    assert!(!wordcraft_fonts::word::resolve_in(a.font_scope, FAMILY, false, false).substituted);
+    // A document made in the session (no fonts of its own) doesn't see it either, and the font
+    // lists don't offer it.
+    let mut s = Session::new(wordcraft_doc::Document::new());
+    let x = text_end_x(&mut s, FAMILY, TEXT);
+    assert!((x - mono).abs() > 1.0, "a new document falls back too: {x} vs {mono}");
+    assert!(!wordcraft_fonts::FontDb::global().has_family(FAMILY));
+    // Each exports to PDF with the faces it lays out with.
+    assert!(crate::io::save_bytes("a.pdf", &a).unwrap().starts_with(b"%PDF"));
+    assert!(crate::io::save_bytes("b.pdf", &b).unwrap().starts_with(b"%PDF"));
+
+    // Opening A again and again loads nothing new: the same font scope, so the same stored files
+    // (the fonts crate's tests count them on a database of their own).
+    for _ in 0..10 {
+        let again = crate::io::open_bytes("a.docx", &a_bytes).unwrap();
+        assert_eq!(again.font_scope, a.font_scope);
+        assert!((end_x(again) - mono).abs() < 0.01);
+    }
+}

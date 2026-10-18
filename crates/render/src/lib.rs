@@ -504,7 +504,7 @@ pub fn render_region(doc: &Document, page: &Page, w: u32, h: u32, view: Affine, 
     let items = page_display(doc, page, &opts.display);
     let visible = view.inverse().transform_rect_bbox(kurbo::Rect::new(0.0, 0.0, w16 as f64, h16 as f64)).inflate(40.0, 40.0);
     if let Some(wm) = &doc.settings.watermark {
-        draw_watermark(&mut ctx, view, page, wm, opts);
+        draw_watermark(&mut ctx, view, page, wm, doc.font_scope, opts);
     }
     for it in &items {
         draw(&mut ctx, doc, it, view, &visible, opts);
@@ -613,8 +613,8 @@ pub fn render_text_line(face: &wordcraft_fonts::FontFace, text: &str, size: f32,
     Rendered { width: w16 as u32, height: h16 as u32, pixels }
 }
 
-fn draw_watermark(ctx: &mut RenderContext, view: Affine, page: &Page, wm: &wordcraft_doc::Watermark, opts: &RenderOptions) {
-    let r = wordcraft_fonts::word::resolve(&wm.font, false, false);
+fn draw_watermark(ctx: &mut RenderContext, view: Affine, page: &Page, wm: &wordcraft_doc::Watermark, font_scope: u32, opts: &RenderOptions) {
+    let r = wordcraft_fonts::word::resolve_in(font_scope, &wm.font, false, false);
     let face = r.face;
     let glyphs = wordcraft_fonts::shape(&face, &wm.text, &[], |c| c);
     let upem = face.upem.max(1.0);

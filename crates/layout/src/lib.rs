@@ -553,6 +553,8 @@ fn env_hash(doc: &Document, opts: &LayoutOptions) -> u64 {
         wordcraft_proof::dictionary_generation(),
         hyphenation_key(doc),
         outline,
+        // Text in a font the document embeds resolves through its scope.
+        doc.font_scope,
     ))
 }
 
