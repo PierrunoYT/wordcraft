@@ -32,13 +32,16 @@ USAGE:
   wordcraft-cli commands [--json]             list every command
   wordcraft-cli parity [--markdown]           feature-catalog parity
   wordcraft-cli mcp [--connect HOST:PORT | --author NAME] [--automation-read-root DIR] [--automation-write-root DIR]
-                                              MCP server on stdio (headless, or bridged to the app).
-                                              --automation-read-root / --automation-write-root confine
-                                              the files the agent's commands read (open, insert text
-                                              or picture, mail-merge data, templates…) and write (save,
-                                              export, merge output…) to DIR, links followed; a root left
-                                              out grants none of its access. They apply to the headless
-                                              server and are an error with --connect.
+                    [--unconfined]            MCP server on stdio (headless, or bridged to the app).
+                                              The headless server confines the files the agent's
+                                              commands read (open, insert text or picture, mail-merge
+                                              data, templates…) and write (save, export, merge output…)
+                                              to the working directory, links followed.
+                                              --automation-read-root / --automation-write-root choose
+                                              the folders instead; a root left out grants none of its
+                                              access. --unconfined lets the agent reach any file you
+                                              can (not with the root flags). With --connect the app's
+                                              own roots apply: the root flags are an error there.
   wordcraft-cli zotero <command> <file> [--cmd 'id={json}' …] [--save OUT] [--trace] [--port P]
                                               run a Zotero command on a document (Zotero must be
                                               running): addEditCitation, addEditBibliography,
@@ -222,6 +225,37 @@ fn automation_roots(
     Ok((roots, left))
 }
 
+/// The roots the `mcp` server confines files to: the ones given; else, headless, the working
+/// directory for reading and writing (#2745); none with `--unconfined` or `--connect` (the app
+/// keeps to its own roots). The root flags with `--unconfined` are a usage error, and with
+/// `--connect` an error.
+fn mcp_roots(
+    given: Option<std::sync::Arc<wordcraft_engine::file_access::AutomationRoots>>,
+    unconfined: bool,
+    bridged: bool,
+    cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<Option<std::sync::Arc<wordcraft_engine::file_access::AutomationRoots>>, Failure> {
+    match given {
+        Some(_) if unconfined => Err(Failure::Usage(
+            "mcp: --unconfined lifts the confinement that --automation-read-root and --automation-write-root set; give one or the other".into(),
+        )),
+        Some(_) if bridged => {
+            Err("mcp: --automation-read-root and --automation-write-root confine the headless server; a running app is not confined by them".into())
+        }
+        Some(roots) => Ok(Some(roots)),
+        None if unconfined || bridged => Ok(None),
+        None => {
+            let here = cwd().map_err(|e| {
+                format!(
+                    "mcp: cannot read the working directory to confine files to it: {e}; give --automation-read-root and --automation-write-root, or --unconfined"
+                )
+            })?;
+            let roots = wordcraft_engine::file_access::AutomationRoots::new(Some(&here), Some(&here)).map_err(|e| format!("mcp: {e}"))?;
+            roots.map(Some).ok_or_else(|| "mcp: no automation roots".into())
+        }
+    }
+}
+
 const NO_OPTIONS: &[OptionSpec] = &[];
 const CONVERT_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--markup", takes_value: false }, OptionSpec { name: "--format", takes_value: true }];
 const RENDER_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--page", takes_value: true }, OptionSpec { name: "--scale", takes_value: true }];
@@ -237,7 +271,11 @@ const RUN_OPTIONS: &[OptionSpec] = &[
 ];
 const COMMANDS_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--json", takes_value: false }];
 const PARITY_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--markdown", takes_value: false }];
-const MCP_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--connect", takes_value: true }, OptionSpec { name: "--author", takes_value: true }];
+const MCP_OPTIONS: &[OptionSpec] = &[
+    OptionSpec { name: "--connect", takes_value: true },
+    OptionSpec { name: "--author", takes_value: true },
+    OptionSpec { name: "--unconfined", takes_value: false },
+];
 const ZOTERO_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--cmd", takes_value: true },
     OptionSpec { name: "--save", takes_value: true },
@@ -250,6 +288,8 @@ const ZOTERO_OPTIONS: &[OptionSpec] = &[
 enum Failure {
     /// A real error, reported on stderr with a failing exit status.
     Error(String),
+    /// Options that contradict each other: reported like an error, with exit status 2.
+    Usage(String),
     /// Whoever read stdout closed it (`wordcraft-cli commands --json | head`): there is nobody left
     /// to write to, so stop quietly and exit 0 like other command-line tools.
     StdoutClosed,
@@ -258,7 +298,7 @@ enum Failure {
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Failure::Error(e) => f.write_str(e),
+            Failure::Error(e) | Failure::Usage(e) => f.write_str(e),
             Failure::StdoutClosed => f.write_str("stdout closed"),
         }
     }
@@ -438,12 +478,8 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             validate_options("mcp", &rest, MCP_OPTIONS)?;
             let author = arg_value(&rest, "--author");
             let connect = arg_value(&rest, "--connect");
-            if roots.is_some() && connect.is_some() {
-                return Err(
-                    "mcp: --automation-read-root and --automation-write-root confine the headless server; a running app is not confined by them"
-                        .into(),
-                );
-            }
+            let unconfined = rest.iter().any(|a| a == "--unconfined");
+            let roots = mcp_roots(roots, unconfined, connect.is_some(), std::env::current_dir)?;
             let backend: Box<dyn wordcraft_mcp::Backend> = match connect {
                 // The app's user name is the person's own setting; don't rewrite it from a flag.
                 Some(_) if author.is_some() => {
@@ -454,6 +490,10 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
                     if let Some(w) = remote.key_warning() {
                         eprintln!("wordcraft-cli: {w}");
                     }
+                    // The bridge checks no paths: what the agent reaches is up to the app (#2745).
+                    eprintln!(
+                        "wordcraft-cli: files not confined by the bridge: the app at {addr} lets the agent read and write any file you can unless it was started with --automation-read-root / --automation-write-root"
+                    );
                     Box::new(remote)
                 }
                 None => {
@@ -464,6 +504,8 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
                         let show = |root: Option<&std::path::Path>| root.map_or_else(|| "none".to_string(), |r| r.display().to_string());
                         eprintln!("wordcraft-cli: files confined: read root {}, write root {}", show(roots.read_root()), show(roots.write_root()));
                         headless = headless.with_automation_roots(Some(roots));
+                    } else {
+                        eprintln!("wordcraft-cli: files not confined (--unconfined): the agent can read and write any file you can");
                     }
                     if let Some(name) = author {
                         set_author(&mut headless.session, &name)?;
@@ -562,6 +604,10 @@ fn main() -> ExitCode {
         Err(Failure::Error(e)) => {
             eprintln!("wordcraft-cli: {e}");
             ExitCode::FAILURE
+        }
+        Err(Failure::Usage(e)) => {
+            eprintln!("wordcraft-cli: {e}");
+            ExitCode::from(2)
         }
     }
 }
@@ -723,6 +769,95 @@ mod tests {
         let dir = std::env::temp_dir().to_string_lossy().into_owned();
         let e = run(&args(&["mcp", "--connect", "127.0.0.1:9", "--automation-read-root", &dir])).unwrap_err().to_string();
         assert!(e.contains("--automation-read-root") && e.contains("headless"), "{e}");
+    }
+
+    /// A fresh `work` folder (standing in for the working directory) holding `notes.txt`, beside
+    /// `outside/secret.txt`.
+    fn work_and_outside(name: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("wc-cli-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("work")).unwrap();
+        std::fs::create_dir_all(base.join("outside")).unwrap();
+        std::fs::write(base.join("work/notes.txt"), "notes").unwrap();
+        std::fs::write(base.join("outside/secret.txt"), "secret").unwrap();
+        (base.clone(), base.join("work"))
+    }
+
+    fn no_cwd() -> std::io::Result<PathBuf> {
+        Err(std::io::ErrorKind::NotFound.into())
+    }
+
+    #[test]
+    fn mcp_confines_files_to_the_working_directory_by_default() {
+        use wordcraft_engine::file_access::Access;
+        let (base, work) = work_and_outside("mcp-default");
+        let inside = work.join("new.docx").to_string_lossy().into_owned();
+        let outside = base.join("outside/secret.txt").to_string_lossy().into_owned();
+
+        // No flags: the working directory is both roots.
+        let roots = mcp_roots(None, false, false, || Ok(work.clone())).unwrap().unwrap();
+        for access in [Access::Read, Access::Write] {
+            assert_eq!(roots.check(&inside, access), Ok(()), "{access:?}");
+            assert!(roots.check(&outside, access).is_err(), "{access:?}");
+        }
+        // `--unconfined`, and the bridge (the app keeps to its own roots): none, and the working
+        // directory isn't needed.
+        assert!(mcp_roots(None, true, false, no_cwd).unwrap().is_none());
+        assert!(mcp_roots(None, false, true, no_cwd).unwrap().is_none());
+        assert!(mcp_roots(None, true, true, no_cwd).unwrap().is_none());
+        // Roots given are the ones in force.
+        let given = wordcraft_engine::file_access::AutomationRoots::new(Some(&base.join("outside")), None).unwrap();
+        let kept = mcp_roots(given, false, false, no_cwd).unwrap().unwrap();
+        assert_eq!(kept.check(&outside, Access::Read), Ok(()));
+        assert!(kept.write_root().is_none());
+        // Roots and `--unconfined`: a usage error (exit status 2), also with `--connect`.
+        for bridged in [false, true] {
+            let given = wordcraft_engine::file_access::AutomationRoots::new(Some(&work), None).unwrap();
+            let e = mcp_roots(given, true, bridged, no_cwd).unwrap_err();
+            assert!(matches!(&e, Failure::Usage(m) if m.contains("--unconfined") && m.contains("--automation-read-root")), "{e:?}");
+        }
+        // No working directory to confine to: an error naming the way out, never an unconfined server.
+        let e = mcp_roots(None, false, false, no_cwd).unwrap_err().to_string();
+        assert!(e.contains("working directory") && e.contains("--unconfined"), "{e}");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn unconfined_with_root_flags_is_refused_on_the_command_line() {
+        assert!(validate_options("mcp", &args(&["--unconfined", "--author", "Claude"]), MCP_OPTIONS).is_ok());
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        for extra in [vec![], vec!["--connect", "127.0.0.1:9"]] {
+            let mut line = vec!["mcp", "--unconfined", "--automation-write-root", &dir];
+            line.extend(extra);
+            let r = run(&args(&line));
+            assert!(matches!(&r, Err(Failure::Usage(m)) if m.contains("--unconfined")), "{line:?}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn a_default_confined_session_refuses_paths_out_of_the_working_directory() {
+        use wordcraft_mcp::Backend;
+        let (base, work) = work_and_outside("mcp-escape");
+        let roots = mcp_roots(None, false, false, || Ok(work.clone())).unwrap();
+        let mut headless = wordcraft_mcp::Headless::default().with_automation_roots(roots);
+        let sep = std::path::MAIN_SEPARATOR;
+        let up = |name: &str| format!("{}{sep}..{sep}outside{sep}{name}", work.display());
+        let mut exec = |command: &str, path: &str| headless.call("engine.execute", json!({"command": command, "params": {"path": path}}));
+
+        let e = exec("file.open", &up("secret.txt")).unwrap_err();
+        assert!(e.contains("outside the read root"), "{e}");
+        let e = exec("file.save", &up("stolen.docx")).unwrap_err();
+        assert!(e.contains("outside the write root"), "{e}");
+        assert!(!base.join("outside/stolen.docx").exists());
+        let e = exec("file.save", &up("secret.txt")).unwrap_err();
+        assert!(e.contains("outside the write root"), "{e}");
+        assert_eq!(std::fs::read_to_string(base.join("outside/secret.txt")).unwrap(), "secret", "not overwritten");
+
+        // Inside the working directory both work.
+        assert!(exec("file.open", &work.join("notes.txt").to_string_lossy()).is_ok());
+        assert!(exec("file.save", &work.join("copy.docx").to_string_lossy()).is_ok());
+        assert!(work.join("copy.docx").exists());
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

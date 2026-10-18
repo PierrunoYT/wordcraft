@@ -150,8 +150,8 @@ Web: `cd apps/wordcraft-web && trunk serve`, then open <http://127.0.0.1:8771/?s
 WordCraft was designed to be driven by people *and* by AI agents.
 
 ```sh
-claude mcp add wordcraft -- wordcraft-cli mcp                  # headless documents
-# confine the agent to folders: wordcraft-cli mcp --automation-read-root DIR --automation-write-root DIR
+claude mcp add wordcraft -- wordcraft-cli mcp                  # headless documents, files in the working directory
+# other folders: wordcraft-cli mcp --automation-read-root DIR --automation-write-root DIR (or --unconfined)
 wordcraft --control 7981 &                                     # or drive the running app…
 claude mcp add wordcraft-app -- wordcraft-cli mcp --connect 127.0.0.1:7981
 ```

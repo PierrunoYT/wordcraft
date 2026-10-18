@@ -4,7 +4,7 @@ WordCraft speaks the [Model Context Protocol](https://modelcontextprotocol.io) o
 Claude and other agents can write and edit documents.
 
 ```sh
-wordcraft-cli mcp                          # headless session (no window)
+wordcraft-cli mcp                          # headless session (no window), files in the working directory
 wordcraft --control 7981 &                 # or: drive the running app…
 wordcraft-cli mcp --connect 127.0.0.1:7981 # …including clicks, keys and screenshots
 ```
@@ -13,7 +13,9 @@ Claude Code: `claude mcp add wordcraft -- wordcraft-cli mcp`.
 
 With `--connect`, the bridge sends the app's control key, which it reads from
 `WORDCRAFT_CONTROL_KEY` or from the key file the app writes at start. It sends the key only to
-loopback addresses; see [Keys](control-protocol.md#keys).
+loopback addresses; see [Keys](control-protocol.md#keys). The bridge checks no paths itself: the
+app's own automation roots decide which files the agent reaches, and without them it reaches any
+file you can. The bridge says so on stderr when it starts.
 
 ## Tracked changes by an agent
 
@@ -25,6 +27,15 @@ with `wordcraft-cli mcp --author "Claude (copyedit)"`, or run
 a document that was saved with it on. `wordcraft-cli run` takes `--author` too.
 
 ## Confining file access
+
+The headless server confines files by default: `wordcraft-cli mcp` with no root flags reads and
+writes only inside the folder it was started in (its working directory, as if it had been given
+`--automation-read-root . --automation-write-root .`), and says so on stderr when it starts
+(`wordcraft-cli: files confined: read root /work/project, write root /work/project`). An MCP
+client usually starts the server in the project's folder; set its working directory (`cwd`) to
+choose another, or give the roots. `--unconfined` lifts the confinement, letting the agent read
+and write any file you can; it can't be combined with the root flags (exit status 2). Only `mcp`
+is confined by default: `run`, `convert` and the other subcommands act on the paths you type.
 
 ```sh
 wordcraft-cli mcp --automation-read-root /work/project --automation-write-root /work/project/out
@@ -49,7 +60,7 @@ config works across the suite) keep the agent to the folders you give it:
   `file.saveTemplate`, and `mailings.finish` with a `path`.
 - Read and write access are separate. Give the same folder twice for both; a root left out grants
   none of its access (with only `--automation-read-root`, nothing can be written to disk). Without
-  either flag nothing changes.
+  either flag, the working directory is both roots (above).
 - A path is made absolute against the server's working directory, then its links are followed: a
   file (or folder) link that leads out of a root is outside it. For a file that doesn't exist yet,
   its nearest existing folder's links are followed and the rest must be plain names, so `..` below a
