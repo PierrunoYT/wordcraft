@@ -76,7 +76,16 @@ pub fn start() {
         if let Some(el) = document.get_element_by_id(LOADING_ID) {
             match result {
                 Ok(()) => el.remove(),
-                Err(e) => el.set_inner_html(&format!("<p>WordCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
+                Err(e) => {
+                    // The error is text, never markup: build the paragraphs, don't parse them.
+                    el.set_text_content(None);
+                    for line in [format!("WordCraft failed to start: {e:?}"), "A browser with WebGPU or WebGL2 is required.".to_string()] {
+                        if let Ok(p) = document.create_element("p") {
+                            p.set_text_content(Some(&line));
+                            let _ = el.append_child(&p);
+                        }
+                    }
+                }
             }
         }
     });
