@@ -52,7 +52,9 @@ pub fn notes(doc: &Document) -> Vec<Note> {
     // Anchor order and the text between each comment's start and end.
     let mut order: Vec<u32> = Vec::new();
     let mut seen = HashSet::new();
-    let mut quotes: HashMap<u32, String> = HashMap::new();
+    // Each quote with its length in characters, so a long anchor costs O(1) per character
+    // rather than a recount of the quote so far.
+    let mut quotes: HashMap<u32, (String, usize)> = HashMap::new();
     let mut open: Vec<u32> = Vec::new();
     for path in doc.para_paths(StoryRef::Body) {
         let Some(p) = doc.para(StoryRef::Body, &path) else { continue };
@@ -73,14 +75,20 @@ pub fn notes(doc: &Document) -> Vec<Note> {
                 continue;
             }
             for id in &open {
-                let q = quotes.entry(*id).or_default();
-                if q.chars().count() <= MAX_QUOTE {
+                let (q, n) = quotes.entry(*id).or_default();
+                if *n <= MAX_QUOTE {
                     q.push(c);
+                    *n += 1;
                 }
             }
         }
         for id in &open {
-            quotes.entry(*id).or_default().push(' ');
+            // Past the cap nothing more is kept, and trailing spaces are dropped below.
+            let (q, n) = quotes.entry(*id).or_default();
+            if *n <= MAX_QUOTE {
+                q.push(' ');
+                *n += 1;
+            }
         }
     }
     for id in doc.comments.keys() {
@@ -104,7 +112,7 @@ pub fn notes(doc: &Document) -> Vec<Note> {
         if root(doc, id) != id {
             continue;
         }
-        let quote = quotes.get(&id).map(|q| q.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        let quote = quotes.get(&id).map(|(q, _)| q.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
         let quote = if quote.chars().count() > MAX_QUOTE { format!("{}…", quote.chars().take(MAX_QUOTE).collect::<String>()) } else { quote };
         let replies =
             replies.get(&id).into_iter().flatten().filter_map(|r| doc.comments.get(r)).map(|r| (author(&r.author), text_of(doc, r.part))).collect();
@@ -197,4 +205,51 @@ fn text(notes: &[Note]) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wordcraft_doc::{CharProps, Comment, Paragraph, PartKind, Pos, para_block};
+
+    fn comment(d: &mut Document, id: u32) {
+        let part = d.add_part(PartKind::Comment, vec![para_block(Paragraph::with_text("Note", CharProps::default()))]);
+        d.comments.insert(id, Comment { author: "Ada".into(), part, ..Default::default() });
+    }
+
+    fn start(d: &mut Document, para: usize, off: usize, id: u32) {
+        d.insert_object(&Pos::body(para, off), InlineObject::CommentStart { id }, &CharProps::default()).unwrap();
+    }
+
+    /// Audit minor (quadratic hotspots): a comment left open over a long document used to recount
+    /// its quote, spaces included, for every character it spans. The quote is still the first
+    /// `MAX_QUOTE` characters, and it is fast.
+    #[test]
+    fn long_open_comments_quote_quickly() {
+        let mut d = Document::from_text(&vec!["word word word word"; 20_000].join("\n"));
+        for id in 0..8 {
+            comment(&mut d, id);
+            start(&mut d, 0, 0, id);
+        }
+        let t = std::time::Instant::now();
+        let notes = notes(&d);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+        assert_eq!(notes.len(), 8);
+        let want = format!("{}…", vec!["word"; 1_000].join(" ").chars().take(MAX_QUOTE).collect::<String>());
+        assert!(notes.iter().all(|n| n.quote == want), "{:?}", notes[0].quote);
+    }
+
+    /// Spaces between paragraphs count toward the cap, as before.
+    #[test]
+    fn paragraph_breaks_count_toward_the_quote() {
+        let mut d = Document::from_text(&format!("ab{}cd", "\n".repeat(MAX_QUOTE + 5)));
+        comment(&mut d, 0);
+        start(&mut d, 0, 0, 0);
+        assert_eq!(notes(&d)[0].quote, "ab");
+        let mut d = Document::from_text("The quarterly\nfigures look strong.");
+        comment(&mut d, 0);
+        d.insert_object(&Pos::body(1, 7), InlineObject::CommentEnd { id: 0 }, &CharProps::default()).unwrap();
+        start(&mut d, 0, 4, 0);
+        assert_eq!(notes(&d)[0].quote, "quarterly figures");
+    }
 }

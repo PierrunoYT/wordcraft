@@ -487,8 +487,10 @@ pub struct LayoutCache {
     /// Narrowest and widest content of paragraphs measured for table autofit ([`Ctx::para_measured`]).
     measures: HashMap<Key, (f32, f32)>,
     /// Outlines of pictures' opaque pixels (Tight and Through wrapping), by media key, the
-    /// media's bytes (address and length) and crop.
-    outlines: HashMap<(String, usize, usize, [u32; 4]), Option<Arc<Vec<(f32, f32)>>>>,
+    /// media's bytes (address and length) and crop, with the last pass that used each.
+    outlines: HashMap<(String, usize, usize, [u32; 4]), (Option<Arc<Vec<(f32, f32)>>>, u64)>,
+    /// Layout passes run with this cache, to tell the outlines still in use from stale ones.
+    pass: u64,
     env: u64,
     used: HashSet<Key>,
     /// The STYLEREF style index of the last pass and what it was built from: the body blocks
@@ -619,6 +621,11 @@ impl Totals {
 /// count (its digits pushing text to another page) is tried again, this many times at most.
 const MAX_TOTAL_PASSES: usize = 3;
 
+/// Picture outlines kept between passes before those a pass didn't use are dropped.
+const KEEP_OUTLINES: usize = 256;
+/// The most picture outlines cached at once (each is at most a few hundred points).
+const MAX_OUTLINES: usize = 4096;
+
 /// A layout pass: finished, or to be done again with the page totals it found.
 enum Pass {
     Done(DocLayout),
@@ -671,14 +678,18 @@ impl Ctx<'_> {
         contour::wrap_outline(o, |media, crop| {
             let bytes = doc.media.get(media)?;
             let key = (media.to_string(), Arc::as_ptr(bytes) as usize, bytes.len(), crop.map(f32::to_bits));
-            if let Some(o) = cache.outlines.get(&key) {
+            let pass = cache.pass;
+            if let Some((o, used)) = cache.outlines.get_mut(&key) {
+                *used = pass;
                 return o.clone();
             }
-            if cache.outlines.len() >= 256 {
+            // Stale outlines go at the end of a pass (see `layout_pass`); this only stops a
+            // single pass over a huge number of pictures from growing the cache without end.
+            if cache.outlines.len() >= MAX_OUTLINES {
                 cache.outlines.clear();
             }
             let outline = contour::picture_outline(bytes, crop).map(Arc::new);
-            cache.outlines.insert(key, outline.clone());
+            cache.outlines.insert(key, (outline.clone(), pass));
             outline
         })
     }
@@ -1989,6 +2000,7 @@ fn layout_pass(
         cache.env = env;
     }
     cache.used.clear();
+    cache.pass = cache.pass.wrapping_add(1);
     // Note references are counted as the body shows them.
     let notes = note_info(doc, opts.hides_deleted(StoryRef::Body), note_pages);
     let notes_hash = hash_of(&{
@@ -2320,6 +2332,12 @@ fn layout_pass(
         ctx.cache.paras.retain(|k, _| used.contains(k));
         ctx.cache.measures.retain(|k, _| used.contains(k));
         ctx.cache.used = used;
+    }
+    // Likewise picture outlines: dropping only those this pass didn't use keeps a document with
+    // many Tight-wrapped pictures from working every outline out again on every pass.
+    if ctx.cache.outlines.len() > KEEP_OUTLINES {
+        let pass = ctx.cache.pass;
+        ctx.cache.outlines.retain(|_, (_, used)| *used == pass);
     }
     let mut index: HashMap<(StoryRef, Path), Vec<(usize, usize)>> = HashMap::new();
     for (pi, p) in pages.iter().enumerate() {
@@ -3435,9 +3453,8 @@ fn place_para_in_flow(ctx: &mut Ctx, pb: &mut PageBuilder, p: &Paragraph, block:
         }
         let n_behind = behind.len();
         if let Some(pg) = pb.pages.last_mut() {
-            for (i, it) in behind.into_iter().enumerate() {
-                pg.items.insert(i.min(pg.items.len()), it);
-            }
+            // In front of everything on the page, in one move (not one per object).
+            pg.items.splice(0..0, behind);
             pg.items.extend(items);
         }
         if let Some(b) = pb.behind.last_mut() {
@@ -3552,9 +3569,7 @@ fn place_outline_para(ctx: &mut Ctx, pb: &mut PageBuilder, p: &Paragraph, block:
     let collapsed = children && o.hidden.get(block + 1).copied().unwrap_or(false);
     items.extend(outline::symbol_items(&pl, x, y, level, children, collapsed));
     if let Some(pg) = pb.page() {
-        for (i, it) in behind.into_iter().enumerate() {
-            pg.items.insert(i.min(pg.items.len()), it);
-        }
+        pg.items.splice(0..0, behind);
         pg.items.extend(items);
     }
     if let (Some(f), Some(l)) = (pl.lines.first(), l1.checked_sub(1).and_then(|k| pl.lines.get(k))) {

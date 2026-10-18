@@ -120,12 +120,13 @@ pub fn sentences(doc: &Document, from: &Pos, to: Option<&Pos>, skip_citations: b
                 }
             }
         }
+        // Sentences are char ranges: index the chars once, not from the start for each sentence.
+        let chars: Vec<char> = text.chars().collect();
         for (a, b) in split_sentences(&text) {
             if out.len() >= MAX_SENTENCES {
                 return out;
             }
-            let chars: Vec<char> = text.chars().skip(a).take(b - a).collect();
-            let spoken = tidy(&chars.iter().collect::<String>());
+            let spoken = tidy(&chars.get(a..b).unwrap_or(&[]).iter().collect::<String>());
             if !spoken.chars().any(char::is_alphanumeric) {
                 continue;
             }
@@ -204,15 +205,23 @@ fn is_abbreviation(chars: &[char], start: usize, dot: usize) -> bool {
 }
 
 /// Collapse whitespace and tidy what removed citations leave behind: "( )", "[]", " ." → ".".
+///
+/// The rewrites are applied as each char is added, at the end of what is kept so far, until none
+/// applies: one pass, where replacing them all over the whole text until nothing changed took a
+/// pass per nesting level ("((((…))))"). Each rewrite shortens the text and no two can disagree
+/// on what they overlap, so the result is the same.
 fn tidy(s: &str) -> String {
-    let mut t: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    loop {
-        let before = t.len();
-        for (from, to) in [("()", ""), ("[]", ""), ("( )", ""), ("[ ]", ""), (" .", "."), (" ,", ","), (" ;", ";"), (" :", ":"), ("  ", " ")] {
-            t = t.replace(from, to);
-        }
-        if t.len() == before {
-            break;
+    const REWRITES: [(&str, &str); 9] =
+        [("()", ""), ("[]", ""), ("( )", ""), ("[ ]", ""), (" .", "."), (" ,", ","), (" ;", ";"), (" :", ":"), ("  ", " ")];
+    let mut t = String::with_capacity(s.len());
+    for (i, word) in s.split_whitespace().enumerate() {
+        for c in (i > 0).then_some(' ').into_iter().chain(word.chars()) {
+            t.push(c);
+            while let Some((from, to)) = REWRITES.iter().find(|(from, _)| t.ends_with(from)) {
+                // The rewrites are ASCII, so the cut is on a char boundary.
+                t.truncate(t.len().saturating_sub(from.len()));
+                t.push_str(to);
+            }
         }
     }
     t.trim().to_string()
@@ -653,6 +662,55 @@ mod tests {
     fn tidy_removes_citation_leftovers() {
         assert_eq!(tidy("as shown  ( ) ."), "as shown.");
         assert_eq!(tidy("as shown [] , and"), "as shown, and");
+    }
+
+    /// Audit minor (quadratic hotspots): `tidy` gives what replacing every leftover over the whole
+    /// text until nothing changed gave, in one pass even when they nest.
+    #[test]
+    fn tidy_matches_replacing_until_nothing_changes() {
+        fn replaced(s: &str) -> String {
+            let mut t: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+            loop {
+                let before = t.len();
+                for (from, to) in [("()", ""), ("[]", ""), ("( )", ""), ("[ ]", ""), (" .", "."), (" ,", ","), (" ;", ";"), (" :", ":"), ("  ", " ")]
+                {
+                    t = t.replace(from, to);
+                }
+                if t.len() == before {
+                    break;
+                }
+            }
+            t.trim().to_string()
+        }
+        // Every string of up to five of these chars, and some longer ones.
+        let alphabet = ['(', ')', '[', ']', ' ', '.', ',', ';', ':', 'a', 'é'];
+        let mut cases = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..5 {
+            level = level.iter().flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}"))).collect();
+            cases.extend(level.iter().cloned());
+        }
+        cases.extend(["see ( [ ( ) ] ) , and ( ( ) ) .", "a\t( \n) ; b", " ( [] ) : end ", "x  ( ( ( ) ) )  ."].map(String::from));
+        for s in &cases {
+            assert_eq!(tidy(s), replaced(s), "{s:?}");
+        }
+        let deep = format!("a{}{} .", "(".repeat(200_000), ")".repeat(200_000));
+        let t = std::time::Instant::now();
+        assert_eq!(tidy(&deep), "a.");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    /// Audit minor (quadratic hotspots): a paragraph of many sentences is read in linear time.
+    #[test]
+    fn many_sentences_in_one_paragraph_are_quick() {
+        let doc = Document::from_text(&"Go now. ".repeat(MAX_SENTENCES));
+        let t = std::time::Instant::now();
+        let got = sentences(&doc, &Pos::body(0, 0), None, false);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+        assert_eq!(got.len(), MAX_SENTENCES);
+        assert!(got.iter().all(|u| u.text == "Go now."));
+        let last = got.last().unwrap();
+        assert_eq!((last.start.off, last.end.off), (8 * (MAX_SENTENCES - 1), 8 * MAX_SENTENCES - 1));
     }
 
     #[test]

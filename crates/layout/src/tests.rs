@@ -7263,3 +7263,76 @@ fn row_nil_overrides_style() {
     d.insert_block(StoryRef::Body, &Path::top(1), wordcraft_doc::Block::Table(t)).unwrap();
     assert_eq!(rules_on_page0(&lay(&d)), vec![2.0]);
 }
+
+/// Audit minor (quadratic hotspots): a paragraph's behind-text objects go in front of everything
+/// on the page in one move rather than one insert each, in the same order as before: the later
+/// paragraph's first, each paragraph's in its own order.
+#[test]
+fn behind_text_objects_go_in_front_of_the_page_in_order() {
+    use wordcraft_doc::para::{Anchor, Float, Wrap};
+    let behind = Float { wrap: Wrap::BehindText, h_rel: Anchor::Page, v_rel: Anchor::Page, x: 10.0, y: 10.0, ..Default::default() };
+    let mut d = Document::new();
+    d.body = [[10.0, 11.0], [20.0, 21.0]]
+        .into_iter()
+        .map(|widths| {
+            let mut p = wordcraft_doc::Paragraph::with_text("Text", Default::default());
+            for w in widths.into_iter().rev() {
+                p.insert_object(0, rect_shape(w, 5.0, behind.clone()), &Default::default()).unwrap();
+            }
+            wordcraft_doc::para_block(p)
+        })
+        .collect();
+    let l = lay(&d);
+    let items = &l.pages[0].items;
+    assert_eq!(shapes(&items[..4]).iter().map(|r| r.w).collect::<Vec<_>>(), [20.0, 21.0, 10.0, 11.0]);
+    // Many in one paragraph: linear, not one shift of the page per object.
+    let mut p = wordcraft_doc::Paragraph::with_text("Many", Default::default());
+    for _ in 0..20_000 {
+        p.insert_object(0, rect_shape(4.0, 4.0, behind.clone()), &Default::default()).unwrap();
+    }
+    d.body = vec![wordcraft_doc::para_block(p)];
+    let t = std::time::Instant::now();
+    let l = lay(&d);
+    assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
+    assert_eq!(shapes(&l.pages[0].items).len(), 20_000);
+}
+
+/// Audit minor (contour cache): with more Tight-wrapped pictures than the cache used to hold, the
+/// next pass reuses every outline instead of working them all out again.
+#[test]
+fn many_tight_pictures_keep_their_outlines_between_passes() {
+    use wordcraft_doc::para::{Float, Wrap};
+    let mut d = Document::new();
+    let mut p = wordcraft_doc::Paragraph::with_text("Pictures", Default::default());
+    for i in 0..300u32 {
+        // A different transparent picture each (an opaque square, its size varying).
+        let s = 4 + i % 28;
+        let img = image::RgbaImage::from_fn(32, 32, |x, y| image::Rgba([0, 0, 0, if x < s && y < s { 255 } else { 0 }]));
+        let mut png = Vec::new();
+        image::DynamicImage::from(img).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let media = format!("media/p{i}.png");
+        d.media.insert(media.clone(), Arc::new(png));
+        let float = Float { wrap: Wrap::Tight, ..Default::default() };
+        let pic = InlineObject::Image { media, w: 20.0, h: 20.0, alt: String::new(), float, crop: [0.0; 4], ole: None };
+        p.insert_object(0, pic, &Default::default()).unwrap();
+    }
+    d.body = vec![wordcraft_doc::para_block(p)];
+    let mut cache = LayoutCache::new();
+    layout(&d, &mut cache, &LayoutOptions::default());
+    let first: HashMap<_, _> = cache.outlines.iter().map(|(k, (o, _))| (k.clone(), o.clone())).collect();
+    assert_eq!(first.len(), 300);
+    layout(&d, &mut cache, &LayoutOptions::default());
+    assert_eq!(cache.outlines.len(), 300);
+    for (k, (o, _)) in &cache.outlines {
+        let same = match (o, first.get(k)) {
+            (Some(a), Some(Some(b))) => Arc::ptr_eq(a, b),
+            (None, Some(None)) => true,
+            _ => false,
+        };
+        assert!(same, "outline of {} worked out again", k.0);
+    }
+    // Pictures no longer in the document are dropped once the cache is past its size.
+    d.body = vec![wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("None", Default::default()))];
+    layout(&d, &mut cache, &LayoutOptions::default());
+    assert!(cache.outlines.is_empty());
+}
