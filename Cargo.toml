@@ -101,6 +101,21 @@ lto = "thin"
 codegen-units = 16
 debug = 0
 
+# Integer overflow checks stay on in release for the parsers of untrusted files: a wrapped length
+# or offset becomes a panic that `Session::run` turns into a failed open, instead of a silently
+# wrong value. Parsers are not hot enough for the checks to matter (audit WC-40).
+[profile.release.package.wordcraft-docbin]
+overflow-checks = true
+
+[profile.release.package.wordcraft-metafile]
+overflow-checks = true
+
+[profile.release.package.wordcraft-docx]
+overflow-checks = true
+
+[profile.release.package.wordcraft-formats]
+overflow-checks = true
+
 # Required by craft-pdf: the backend rejects writers that failed during unwinding.
 [patch.crates-io]
 krilla = { git = "https://github.com/storytold/craft-libs", rev = "c3487320b2d1de657b860b3c8abb44e1f2b32bd8" }
