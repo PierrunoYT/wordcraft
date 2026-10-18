@@ -7238,3 +7238,44 @@ fn vertical_align_command_sets_justified() {
         assert_eq!(serde_json::to_value(crate::cmd::page::sect(&s)).unwrap()["valign"], json!(name));
     }
 }
+
+/// WC-23: a Word file with a corrupt part opens without it, and the status bar and the result
+/// name the part (a save drops it) instead of it being lost silently.
+#[test]
+fn opening_a_package_with_a_corrupt_part_names_it() {
+    use std::io::{Read, Write};
+    let mut src = s();
+    run(&mut src, "text.insert", json!({"text": "Still here"}));
+    let good = crate::io::save_bytes("c.docx", &src.doc).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&good)).unwrap();
+    let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflate = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    // The broken part goes first: its headers are the first local and central records.
+    out.start_file("customXml/item9.xml", deflate).unwrap();
+    out.write_all(&[b'z'; 4_000]).unwrap();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).unwrap();
+        let name = f.name().to_string();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        out.start_file(name, deflate).unwrap();
+        out.write_all(&buf).unwrap();
+    }
+    let mut bad = out.finish().unwrap().into_inner();
+    // Break its checksum in the local header and the central directory.
+    let first = |z: &[u8], sig: &[u8]| z.windows(4).position(|w| w == sig).unwrap();
+    let (local, central) = (first(&bad, b"PK\x03\x04"), first(&bad, b"PK\x01\x02"));
+    bad[local + 14] ^= 0xFF;
+    bad[central + 16] ^= 0xFF;
+    let mut s2 = s();
+    let r = run(&mut s2, "file.open", json!({"path": "c.docx", "data": crate::cmd::insert::base64_encode(&bad)}));
+    assert_eq!(r["unreadableParts"], json!(["customXml/item9.xml"]));
+    assert_eq!(r["unreadableCount"], 1);
+    assert!(s2.status.contains("customXml/item9.xml") && s2.status.contains("saving"), "{}", s2.status);
+    assert!(text(&s2).contains("Still here"));
+    assert!(!s2.doc.passthrough.contains_key(wordcraft_docx::UNREADABLE_PARTS), "not carried in the document");
+    // An intact file says nothing.
+    let mut s3 = s();
+    let r = run(&mut s3, "file.open", json!({"path": "c.docx", "data": crate::cmd::insert::base64_encode(&good)}));
+    assert!(r.get("unreadableParts").is_none() && s3.status.is_empty(), "{}", s3.status);
+}

@@ -200,6 +200,9 @@ fn normal_document(s: &Session) -> Document {
     d
 }
 
+/// File › Open. Parts of a Word package that can't be read (corrupt data, a bad checksum) are
+/// left out of the document: the status bar names them, and so does the result
+/// (`unreadableParts`, `unreadableCount`).
 fn open(s: &mut Session, v: &Value) -> CmdResult {
     let Some(path) = p::str(v, "path") else {
         s.ui_requests.push(json!({"open": "openFile"}));
@@ -220,6 +223,7 @@ fn open(s: &mut Session, v: &Value) -> CmdResult {
     } else {
         crate::io::open_path_in(std::path::Path::new(path), password, &s.region()).map_err(CmdError::Failed)?
     };
+    let unreadable = wordcraft_docx::take_unreadable_parts(&mut doc);
     // Plain text and Markdown carry no language: they are in the editing language.
     let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     if let Some(lang) = &s.editing_lang
@@ -236,7 +240,25 @@ fn open(s: &mut Session, v: &Value) -> CmdResult {
     if encrypted {
         s.password = password.map(crate::io::Password::new);
     }
-    Ok(json!({"path": path, "paragraphs": s.doc.paragraph_count(), "words": s.doc.word_count(), "encrypted": encrypted}))
+    let mut r = json!({"path": path, "paragraphs": s.doc.paragraph_count(), "words": s.doc.word_count(), "encrypted": encrypted});
+    if let Some(u) = unreadable {
+        s.status = unreadable_message(&u);
+        r["unreadableParts"] = json!(u.names);
+        r["unreadableCount"] = json!(u.total);
+    }
+    Ok(r)
+}
+
+/// What the status bar says when a file's package held parts that couldn't be read (WC-23):
+/// they are missing from the document, so saving it drops them.
+fn unreadable_message(u: &wordcraft_docx::UnreadableParts) -> String {
+    const SHOWN: usize = 5;
+    let mut names = u.names.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    let more = u.total.saturating_sub(u.names.len().min(SHOWN));
+    if more > 0 {
+        names.push_str(&format!(" and {more} more"));
+    }
+    format!("Some parts of this file couldn't be read and were left out (saving won't keep them): {names}")
 }
 
 /// File › Info › Protect Document › Encrypt with Password: the password Word documents are saved

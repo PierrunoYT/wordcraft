@@ -13,6 +13,10 @@ pub const MAX_PART: u64 = 256 * 1024 * 1024;
 pub const MAX_TOTAL: u64 = 512 * 1024 * 1024;
 /// Most zip entries we look at.
 pub const MAX_ENTRIES: usize = 20_000;
+/// Most names of unreadable zip entries we keep for the report (all of them are counted).
+pub const MAX_SKIPPED_NAMES: usize = 32;
+/// Longest name of an unreadable zip entry we keep, in characters.
+const MAX_SKIPPED_NAME: usize = 200;
 
 /// Relationship type suffixes (after `.../relationships/`).
 pub mod rt {
@@ -81,6 +85,11 @@ pub const APP_KEPT_PROPS: &[&str] =
 /// the package, `D` for the main document), with their bytes and relationships in the
 /// [`EmbeddedManifest`]. Not a package part: WordCraft's own bookkeeping.
 pub const UNMODELLED_ROOTS: &str = "wordcraft:unmodelled.roots";
+/// `Document::passthrough` key reporting the zip entries the file held that couldn't be read
+/// (corrupt data, a bad checksum) and so are missing from the document, as [`UnreadableParts`]
+/// (the count, then a name per line). Never written to a file: WordCraft's own bookkeeping,
+/// taken out by [`take_unreadable_parts`] when the file is opened.
+pub const UNREADABLE_PARTS: &str = "wordcraft:unreadable.parts";
 /// Most parts we carry along for a file's embedded objects.
 pub const MAX_EMBEDDED_PARTS: usize = 4096;
 /// Most relationships we keep for one such part.
@@ -162,6 +171,11 @@ pub struct Package {
     /// Lowercased part name → the name it is stored under. OPC part names compare
     /// case-insensitively, so a package holds one part per lowercased name.
     lower: HashMap<String, String>,
+    /// The zip entries that couldn't be read (corrupt data, a bad checksum): their names (at
+    /// most [`MAX_SKIPPED_NAMES`]) and how many there were. They are missing from the document,
+    /// so a save drops them: the reader reports them ([`UNREADABLE_PARTS`]).
+    skipped: Vec<String>,
+    skipped_total: usize,
 }
 
 impl Package {
@@ -175,22 +189,32 @@ impl Package {
             return Err(DocxError::Limit(format!("{} zip entries", zip.len())));
         }
         let mut files = BTreeMap::new();
+        let mut skipped = Vec::new();
+        let mut skipped_total = 0usize;
+        let mut skip = |name: &str| {
+            skipped_total = skipped_total.saturating_add(1);
+            if skipped.len() < MAX_SKIPPED_NAMES {
+                skipped.push(report_name(name));
+            }
+        };
         let mut total: u64 = 0;
         // Compressed data ranges read so far (start → end): entries sharing or overlapping their
         // data would make one small stream inflate once per entry.
         let mut ranges: BTreeMap<u64, u64> = BTreeMap::new();
         for i in 0..zip.len() {
+            // Taken before the entry is opened, which borrows the archive: a failed open reports it.
+            let name = zip.name_for_index(i).map_or_else(|| format!("zip entry {}", i.saturating_add(1)), |n| n.trim_start_matches('/').to_string());
             let mut f = match zip.by_index(i) {
                 Ok(f) => f,
                 Err(e) => {
-                    log::warn!("docx: skipping unreadable zip entry {i}: {e}");
+                    log::warn!("docx: skipping unreadable zip entry {name}: {e}");
+                    skip(&name);
                     continue;
                 }
             };
             if f.is_dir() {
                 continue;
             }
-            let name = f.name().trim_start_matches('/').to_string();
             if f.size() > max_part {
                 return Err(DocxError::Limit(format!("part {name} declares {} bytes", f.size())));
             }
@@ -216,11 +240,21 @@ impl Package {
             if let Err(e) = read {
                 // A corrupt entry: keep going unless it's a part we can't do without.
                 log::warn!("docx: zip entry {name} unreadable: {e}");
+                skip(&name);
                 continue;
             }
             files.insert(name, buf);
         }
-        Ok(Package::from_parts(files))
+        let mut pkg = Package::from_parts(files);
+        pkg.skipped = skipped;
+        pkg.skipped_total = skipped_total;
+        Ok(pkg)
+    }
+
+    /// The zip entries that couldn't be read, as reported ([`UNREADABLE_PARTS`]); `None` when
+    /// every entry was read.
+    pub fn unreadable(&self) -> Option<UnreadableParts> {
+        (self.skipped_total > 0).then(|| UnreadableParts { names: self.skipped.clone(), total: self.skipped_total })
     }
 
     /// A package from parts already in memory (a Flat OPC file, a converted document), by part
@@ -241,7 +275,7 @@ impl Package {
             log::warn!("docx: dropping part {name}, a case variant of another part's name");
             files.remove(&name);
         }
-        Package { files: files.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(), lower }
+        Package { files: files.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(), lower, skipped: Vec::new(), skipped_total: 0 }
     }
 
     /// The name part `name` is stored under (leading `/` ignored; case-insensitive), if any.
@@ -292,6 +326,52 @@ impl Package {
         }
         rels
     }
+}
+
+/// A zip entry name fit for a report line: control characters replaced, at most
+/// [`MAX_SKIPPED_NAME`] characters.
+fn report_name(name: &str) -> String {
+    let mut out: String = name.chars().take(MAX_SKIPPED_NAME).map(|c| if c.is_control() { '?' } else { c }).collect();
+    if name.chars().nth(MAX_SKIPPED_NAME).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// The zip entries a file held that couldn't be read and so are missing from its document
+/// (see [`UNREADABLE_PARTS`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnreadableParts {
+    /// Their names, at most [`MAX_SKIPPED_NAMES`].
+    pub names: Vec<String>,
+    /// How many there were in all (at least `names.len()`).
+    pub total: usize,
+}
+
+impl UnreadableParts {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut s = self.total.to_string();
+        for n in &self.names {
+            s.push('\n');
+            s.push_str(n);
+        }
+        s.into_bytes()
+    }
+
+    pub fn parse(bytes: &[u8]) -> UnreadableParts {
+        let text = String::from_utf8_lossy(bytes);
+        let mut lines = text.lines();
+        let total = lines.next().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(0);
+        let names: Vec<String> = lines.filter(|l| !l.is_empty()).take(MAX_SKIPPED_NAMES).map(report_name).collect();
+        UnreadableParts { total: total.max(names.len()), names }
+    }
+}
+
+/// Take the report of unreadable parts ([`UNREADABLE_PARTS`]) out of `doc`, for telling the
+/// user when the file is opened. `None` when every part was read.
+pub fn take_unreadable_parts(doc: &mut wordcraft_doc::Document) -> Option<UnreadableParts> {
+    let r = UnreadableParts::parse(&doc.passthrough.remove(UNREADABLE_PARTS)?);
+    (r.total > 0).then_some(r)
 }
 
 /// `[Content_Types].xml`: Override by part name, then Default by extension (both case-insensitive).
@@ -465,7 +545,70 @@ mod tests {
         }
         let skipped = Package::open_limited(&z, 1_000_000, 10_000_000).unwrap();
         assert!(skipped.get("a.xml").is_none() && skipped.get("b.xml").is_some());
+        assert_eq!(skipped.unreadable(), Some(UnreadableParts { names: vec!["a.xml".into()], total: 1 }));
         assert!(matches!(Package::open_limited(&z, 1_000_000, 1_000_000), Err(DocxError::Limit(_))));
+    }
+
+    /// A minimal package whose `customXml/item1.xml` (first) and `word/media/x.bin` (second)
+    /// are broken as `break_entry` says, with an intact main part after them.
+    fn package_with_broken_parts(break_entry: impl Fn(&mut Vec<u8>, usize)) -> Vec<u8> {
+        let main = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Kept</w:t></w:r></w:p></w:body></w:document>"#;
+        let mut z =
+            zip_of(&[("customXml/item1.xml", vec![b'x'; 5_000]), ("word/media/x.bin", vec![b'y'; 5_000]), ("word/document.xml", main.to_vec())]);
+        break_entry(&mut z, 0);
+        break_entry(&mut z, 1);
+        z
+    }
+
+    /// WC-23: a corrupt part doesn't stop the file opening, and the document reports it by name
+    /// (it is missing, so a save drops it) instead of losing it silently.
+    #[test]
+    fn unreadable_parts_are_reported() {
+        // A bad checksum (local header and central directory): the data inflates, then fails.
+        let bad_crc = |z: &mut Vec<u8>, n: usize| {
+            for (pos, off) in [(record(z, LOCAL, n), 14), (record(z, CENTRAL, n), 16)] {
+                z[pos + off] ^= 0xFF;
+            }
+        };
+        let mut doc = crate::read(&package_with_broken_parts(bad_crc)).unwrap();
+        assert!(doc.plain_text(wordcraft_doc::StoryRef::Body).contains("Kept"));
+        assert!(doc.passthrough.contains_key(UNREADABLE_PARTS));
+        let u = take_unreadable_parts(&mut doc).unwrap();
+        assert_eq!(u, UnreadableParts { names: vec!["customXml/item1.xml".into(), "word/media/x.bin".into()], total: 2 });
+        assert!(!doc.passthrough.contains_key(UNREADABLE_PARTS), "taken out");
+        // The report is bookkeeping, never a part of a saved file.
+        let mut again = crate::read(&package_with_broken_parts(bad_crc)).unwrap();
+        let saved = crate::write(&again).unwrap();
+        assert!(!saved.windows(b"unreadable".len()).any(|w| w == b"unreadable"));
+        assert!(take_unreadable_parts(&mut again).is_some());
+        assert!(take_unreadable_parts(&mut crate::read(&saved).unwrap()).is_none(), "nothing unreadable in the saved file");
+
+        // Truncated deflate data: the compressed size is shrunk, so the stream ends early.
+        let truncated = |z: &mut Vec<u8>, n: usize| {
+            for (pos, off) in [(record(z, LOCAL, n), 18), (record(z, CENTRAL, n), 20)] {
+                z[pos + off..pos + off + 4].copy_from_slice(&4u32.to_le_bytes());
+            }
+        };
+        let u = take_unreadable_parts(&mut crate::read(&package_with_broken_parts(truncated)).unwrap()).unwrap();
+        assert_eq!(u.names, ["customXml/item1.xml", "word/media/x.bin"]);
+    }
+
+    /// WC-23: the report keeps a bounded number of tidied names but counts every entry.
+    #[test]
+    fn unreadable_report_is_bounded() {
+        let long = "n".repeat(MAX_SKIPPED_NAME + 50);
+        let name = report_name(&format!("a\nb\t{long}"));
+        assert!(name.starts_with("a?b?") && name.chars().count() == MAX_SKIPPED_NAME + 1 && name.ends_with('…'));
+        let u = UnreadableParts { names: (0..MAX_SKIPPED_NAMES).map(|i| format!("p{i}")).collect(), total: 1_000 };
+        assert_eq!(UnreadableParts::parse(&u.to_bytes()), u);
+        let junk = UnreadableParts::parse(b"lots\n\n\xff\xfe");
+        assert_eq!((junk.total, junk.names.len()), (1, 1));
+        let mut lines = b"9".to_vec();
+        for i in 0..MAX_SKIPPED_NAMES + 10 {
+            lines.extend_from_slice(format!("\nq{i}").as_bytes());
+        }
+        let many = UnreadableParts::parse(&lines);
+        assert_eq!((many.names.len(), many.total), (MAX_SKIPPED_NAMES, MAX_SKIPPED_NAMES));
     }
 
     /// WC-23: entries sharing (or overlapping) compressed data are refused, so one small stream

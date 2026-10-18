@@ -316,6 +316,11 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
     }
     let mut doc = r.doc;
     doc.ensure_nonempty();
+    // Zip entries that couldn't be read are missing from the document (and from a save of it):
+    // say which, for the caller to tell the user.
+    if let Some(u) = pkg.unreadable() {
+        doc.passthrough.insert(crate::package::UNREADABLE_PARTS.into(), Arc::new(u.to_bytes()));
+    }
     Ok(doc)
 }
 
