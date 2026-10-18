@@ -7256,7 +7256,7 @@ fn opening_a_package_with_a_corrupt_part_names_it() {
     out.write_all(&[b'z'; 4_000]).unwrap();
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).unwrap();
-        let name = f.name().to_string();
+        let name = String::from_utf8_lossy(f.name_raw()).into_owned();
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).unwrap();
         out.start_file(name, deflate).unwrap();
