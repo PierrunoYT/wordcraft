@@ -1744,6 +1744,8 @@ fn zotero(app: &mut WordApp, ui: &mut Ui) {
         big(ui, app, "update", "Refresh", "ui.zotero.refresh", json!({}), false);
         big(ui, app, "docPrefs", "Document\nPreferences", "ui.zotero.setDocPrefs", json!({}), false);
         big(ui, app, "unlinkCitations", "Unlink\nCitations", "ui.zotero.removeCodes", json!({}), false);
+        // Ends the command in flight (on only while one runs).
+        big(ui, app, "close", "Cancel", "ui.zotero.cancel", json!({}), false);
     });
 }
 

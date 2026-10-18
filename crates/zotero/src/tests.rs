@@ -393,6 +393,118 @@ fn cancelled_session_and_no_zotero() {
     assert!(matches!(r, Err(ZoteroError::NotRunning(_))));
 }
 
+/// A squatter on Zotero's port: accepts one connection, reads the command, sends `frames`
+/// (txid, payload) without waiting for replies, then holds the socket until we close it. Returns
+/// the replies it read.
+fn squatter(frames: Vec<(u32, Vec<u8>)>) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<Vec<u8>>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let h = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let _command = wire::read_frame(&mut s).unwrap().unwrap();
+        let mut writer = s.try_clone().unwrap();
+        // Write from another thread so a reader that stops reading can't block the replies.
+        let w = std::thread::spawn(move || {
+            for (tx, p) in frames {
+                if wire::write_frame(&mut writer, tx, &p).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut replies = Vec::new();
+        while let Ok(Some(f)) = wire::read_frame(&mut s) {
+            replies.push(f.payload);
+        }
+        let _ = w.join();
+        replies
+    });
+    (addr, h)
+}
+
+/// WC-32: a process on Zotero's port gets bounded calls and bytes per command, and rich text over
+/// its limit is refused before it reaches the document.
+#[test]
+fn a_squatter_on_zotero_s_port_is_bounded() {
+    let limits = client::Limits { calls: 20, bytes: 4096, rich_text: 256 };
+    // Too many calls: endless no-op frames end the session with an error.
+    let (addr, server) = squatter((0..1000).map(|_| (0, b"[]".to_vec())).collect());
+    let opts = Options { addr, limits, ..Options::default() };
+    let mut answered = 0;
+    let r = client::run_command(&opts, Command::Refresh, &mut |_| {
+        answered += 1;
+        Ok(Value::Null)
+    });
+    assert!(matches!(&r, Err(ZoteroError::Protocol(m)) if m.contains("calls")), "{r:?}");
+    assert_eq!(answered, 0);
+    server.join().unwrap();
+
+    // Too many bytes: a few large calls pass the byte budget long before the call cap.
+    let big = serde_json::to_vec(&json!(["Field_getText", [1, 1, "x".repeat(1500)]])).unwrap();
+    let (addr, server) = squatter((1..=10).map(|tx| (tx, big.clone())).collect());
+    let opts = Options { addr, limits, ..Options::default() };
+    let mut answered = 0;
+    let r = client::run_command(&opts, Command::Refresh, &mut |_| {
+        answered += 1;
+        Ok(Value::Null)
+    });
+    assert!(matches!(&r, Err(ZoteroError::Protocol(m)) if m.contains("bytes")), "{r:?}");
+    assert!(answered <= 2, "{answered} calls answered past the byte budget");
+    server.join().unwrap();
+
+    // Rich text over its limit is answered with an error and never parsed; small text still is.
+    let huge = serde_json::to_vec(&json!(["Field_setText", [1, 1, format!("{{\\rtf {}}}", "y".repeat(400)), true]])).unwrap();
+    let html = serde_json::to_vec(&json!(["Document_insertText", [1, "z".repeat(400)]])).unwrap();
+    let small = serde_json::to_vec(&json!(["Field_setText", [1, 1, "(Doe, 2020)", false]])).unwrap();
+    let done = serde_json::to_vec(&json!(["Document_complete", [1]])).unwrap();
+    let (addr, server) = squatter(vec![(1, huge), (2, html), (3, small), (4, done)]);
+    let opts = Options { addr, limits, ..Options::default() };
+    let mut seen = Vec::new();
+    let out = client::run_command(&opts, Command::Refresh, &mut |c| {
+        seen.push(c.method.clone());
+        Ok(Value::Null)
+    })
+    .unwrap();
+    assert_eq!(seen, ["Field_setText", "Document_complete"]);
+    assert!(out.completed);
+    assert_eq!(out.errors.len(), 2);
+    let replies = server.join().unwrap();
+    assert!(replies[0].starts_with(b"ERR:Field_setText") && replies[1].starts_with(b"ERR:Document_insertText"));
+    assert_eq!(replies[2], b"null");
+
+    // The defaults leave room for a long bibliography but not for tens of MB in one frame.
+    let d = client::Limits::default();
+    assert!(d.rich_text >= 1024 * 1024 && d.rich_text < wire::MAX_FRAME && wire::MAX_FRAME < d.bytes);
+    let mut head = vec![0u8, 0, 0, 1];
+    head.extend_from_slice(&u32::try_from(wire::MAX_FRAME + 1).unwrap().to_be_bytes());
+    assert!(matches!(wire::read_frame(&mut head.as_slice()), Err(ZoteroError::Protocol(_))));
+}
+
+/// WC-32: Cancel ends a session whose peer never answers, at once, and a session cancelled
+/// before it connects never connects.
+#[test]
+fn cancel_ends_a_session_that_waits_forever() {
+    let (addr, server) = squatter(Vec::new());
+    let opts = Options { addr, ..Options::default() };
+    let cancel = client::Cancel::new();
+    let switch = cancel.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(client::run_cancellable(&opts, Command::Refresh, &switch, &mut |_| Ok(Value::Null)));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(rx.try_recv().is_err(), "the session is waiting on the squatter");
+    cancel.cancel();
+    let out = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("cancel ends the session").unwrap();
+    assert!(out.cancelled && !out.completed, "{out:?}");
+    server.join().unwrap();
+
+    let free = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let cancel = client::Cancel::new();
+    cancel.cancel();
+    let out = client::run_cancellable(&Options { addr: free, ..Options::default() }, Command::Refresh, &cancel, &mut |_| Ok(Value::Null));
+    assert_eq!(out, Ok(client::Outcome { cancelled: true, ..Default::default() }), "no connection attempted, so no NotRunning");
+}
+
 #[test]
 fn command_names() {
     for c in Command::ALL {

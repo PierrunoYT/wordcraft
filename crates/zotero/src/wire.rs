@@ -11,8 +11,13 @@ use crate::ZoteroError;
 
 /// Zotero's word-processor integration port.
 pub const PORT: u16 = 23116;
-/// Largest payload accepted (a long bibliography's rich text is a few MB at most).
-pub const MAX_FRAME: usize = 32 * 1024 * 1024;
+/// Largest payload accepted from Zotero. Its calls carry one citation code or one formatted
+/// citation or bibliography; a long bibliography's rich text is a few hundred KB, so this leaves
+/// wide headroom (rich text has a lower limit of its own, [`crate::client::Limits`]).
+pub const MAX_FRAME: usize = 8 * 1024 * 1024;
+/// Largest reply sent. `Document_getFields` lists every field code in the document, so a long
+/// document's answer can be larger than any one call.
+pub const MAX_REPLY: usize = 32 * 1024 * 1024;
 /// Integration template version we implement.
 pub const TEMPLATE_VERSION: u32 = 1;
 
@@ -43,14 +48,18 @@ pub fn read_frame(r: &mut impl Read) -> Result<Option<Frame>, ZoteroError> {
     if len > MAX_FRAME {
         return Err(ZoteroError::Protocol(format!("frame of {len} bytes is over the {MAX_FRAME}-byte limit")));
     }
-    let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload).map_err(|e| ZoteroError::Io(e.to_string()))?;
+    // Grow with the bytes that arrive rather than allocating the announced length up front.
+    let mut payload = Vec::new();
+    r.take(u64::try_from(len).unwrap_or(u64::MAX)).read_to_end(&mut payload).map_err(|e| ZoteroError::Io(e.to_string()))?;
+    if payload.len() < len {
+        return Err(ZoteroError::Protocol("connection closed inside a frame".into()));
+    }
     Ok(Some(Frame { txid, payload }))
 }
 
 /// Write one frame.
 pub fn write_frame(w: &mut impl Write, txid: u32, payload: &[u8]) -> Result<(), ZoteroError> {
-    let len = u32::try_from(payload.len()).ok().filter(|l| (*l as usize) <= MAX_FRAME);
+    let len = u32::try_from(payload.len()).ok().filter(|l| (*l as usize) <= MAX_REPLY);
     let Some(len) = len else { return Err(ZoteroError::Protocol("reply too large".into())) };
     let mut buf = Vec::with_capacity(8 + payload.len());
     buf.extend_from_slice(&txid.to_be_bytes());

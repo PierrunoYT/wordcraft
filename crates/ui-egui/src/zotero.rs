@@ -1,6 +1,7 @@
 //! Zotero in the app: `ui.zotero.<command>` (`addEditCitation`, `addEditBibliography`, `addNote`,
-//! `refresh`, `removeCodes`, `setDocPrefs`), `ui.zotero.status`, and `ui.zotero.answer
-//! {"button": n}` to answer a question Zotero is asking (agents; people click the dialog).
+//! `refresh`, `removeCodes`, `setDocPrefs`), `ui.zotero.status`, `ui.zotero.answer
+//! {"button": n}` to answer a question Zotero is asking (agents; people click the dialog), and
+//! `ui.zotero.cancel` to end the command in flight (Zotero › Cancel).
 //!
 //! A command runs on a background thread that holds the socket to Zotero. Each call Zotero makes
 //! is handed to the UI thread, answered against the session by [`wordcraft_zotero::Bridge`] in
@@ -38,6 +39,8 @@ pub struct ZoteroLink {
     alert: Option<Alert>,
     /// The command in flight.
     pub busy: Option<Command>,
+    /// Ends the command in flight's connection.
+    cancel: Option<wordcraft_zotero::client::Cancel>,
     /// The document the command in flight started in; its calls are refused once another is open.
     document: u64,
     /// How the last command ended.
@@ -75,6 +78,9 @@ pub fn command(app: &mut WordApp, id: &str, params: &Value, ctx: Option<&egui::C
         };
         return Some(answer(app, button));
     }
+    if name == "cancel" {
+        return Some(cancel(app));
+    }
     let Some(cmd) = Command::from_name(name) else {
         let names: Vec<&str> = Command::ALL.iter().map(|c| c.wire_name()).collect();
         return Some(Err(format!("unknown Zotero command `{name}`; use one of {}", names.join(", "))));
@@ -103,8 +109,10 @@ fn start(app: &mut WordApp, cmd: Command, ctx: Option<egui::Context>) -> Result<
     let (done_tx, done_rx) = channel();
     let wake = ctx.clone();
     let opts = app.zotero.options.clone();
+    let cancel = wordcraft_zotero::client::Cancel::new();
+    let switch = cancel.clone();
     let spawned = std::thread::Builder::new().name("zotero".into()).spawn(move || {
-        let r = wordcraft_zotero::client::run_command(&opts, cmd, &mut |call| {
+        let r = wordcraft_zotero::client::run_cancellable(&opts, cmd, &switch, &mut |call| {
             let (tx, rx) = channel();
             if call_tx.send(Pending { call: call.clone(), reply: tx }).is_err() {
                 return Err("WordCraft closed the document".into());
@@ -126,6 +134,7 @@ fn start(app: &mut WordApp, cmd: Command, ctx: Option<egui::Context>) -> Result<
     z.calls = Some(call_rx);
     z.done = Some(done_rx);
     z.busy = Some(cmd);
+    z.cancel = Some(cancel);
     z.document = document;
     log::info!("Zotero: {} started", cmd.wire_name());
     app.status(tl!("Waiting for Zotero…"));
@@ -149,6 +158,27 @@ pub fn answer(app: &mut WordApp, button: i64) -> Result<Value, String> {
         c.request_repaint();
     }
     Ok(json!({"answered": button}))
+}
+
+/// End the command in flight. Its connection is shut down, so the session stops whatever the
+/// other end does (Zotero, or something else listening on Zotero's port); edits already made
+/// stay, as one undo step.
+pub fn cancel(app: &mut WordApp) -> Result<Value, String> {
+    let Some(cmd) = app.zotero.busy.take() else { return Err("Zotero isn't working on anything".into()) };
+    if let Some(c) = app.zotero.cancel.take() {
+        c.cancel();
+    }
+    let z = &mut app.zotero;
+    // Dropping these answers any call the thread still waits on with an error.
+    z.calls = None;
+    z.done = None;
+    z.alert = None;
+    let calls = std::mem::take(&mut z.methods).len();
+    log::info!("Zotero: {} cancelled after {calls} calls", cmd.wire_name());
+    z.last = Some(json!({"command": cmd.wire_name(), "completed": false, "cancelled": true, "calls": calls, "errors": []}));
+    app.status(tl!("Zotero: cancelled"));
+    app.canvas.want_focus = true;
+    Ok(json!({"cancelled": cmd.wire_name()}))
 }
 
 /// Answer Zotero's calls (each frame).
@@ -186,6 +216,7 @@ pub fn poll(app: &mut WordApp, ctx: &egui::Context) {
     let done = app.zotero.done.as_ref().and_then(|rx| rx.try_recv().ok());
     if let Some(r) = done {
         let cmd = app.zotero.busy.take();
+        app.zotero.cancel = None;
         app.zotero.calls = None;
         app.zotero.done = None;
         app.zotero.alert = None;
@@ -341,6 +372,44 @@ mod tests {
         server.join().unwrap();
         assert_eq!(app.session.doc.plain_text(StoryRef::Body), "");
         assert!(!app.session.can_undo(), "the old command left no undo step in the new document");
+    }
+
+    /// WC-32: something on Zotero's port that never finishes can be cancelled from the ribbon,
+    /// which frees the Zotero buttons at once.
+    #[test]
+    fn cancel_ends_a_session_that_never_finishes() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let squatter = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let _command = wire::read_frame(&mut s).unwrap().unwrap();
+            // Ask a question, then hold the socket until WordCraft closes it.
+            wire::write_frame(&mut s, 1, &serde_json::to_vec(&json!(["Document_displayAlert", [1, "Wait?", 1, 1]])).unwrap()).unwrap();
+            while let Ok(Some(_)) = wire::read_frame(&mut s) {}
+        });
+        let mut app = WordApp::new(Session::new(Document::from_text("x")), Services::default());
+        app.zotero.options.addr = addr;
+        let ctx = egui::Context::default();
+        app.ctx = Some(ctx.clone());
+        assert!(!crate::widgets::enabled(&app, "ui.zotero.cancel"), "nothing to cancel yet");
+        assert!(app.run("ui.zotero.cancel", json!({})).is_err());
+        app.run("ui.zotero.refresh", json!({})).unwrap();
+        pump(&mut app, &ctx, |a| a.zotero.alert.is_some());
+        assert!(crate::widgets::enabled(&app, "ui.zotero.cancel"));
+        assert!(!crate::widgets::enabled(&app, "ui.zotero.refresh"));
+        assert_eq!(app.run("ui.zotero.cancel", json!({})).unwrap(), json!({"cancelled": "refresh"}));
+        assert!(app.zotero.busy.is_none() && app.zotero.alert.is_none());
+        assert!(crate::widgets::enabled(&app, "ui.zotero.refresh"), "the buttons are free again");
+        let st = app.run("ui.zotero.status", json!({})).unwrap();
+        assert_eq!(st["last"]["cancelled"], true, "{st}");
+        // The socket was shut down, so the squatter's connection ends.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(squatter.join().map_err(|_| "the squatter panicked"));
+        });
+        let ended = rx.recv_timeout(std::time::Duration::from_secs(60));
+        assert!(matches!(ended, Ok(Ok(()))), "{ended:?}");
+        assert_eq!(app.session.doc.plain_text(StoryRef::Body), "x");
     }
 
     #[test]

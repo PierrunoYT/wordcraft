@@ -3,8 +3,8 @@
 WordCraft works with the [Zotero](https://www.zotero.org) desktop app the way Word does: Zotero's
 own citation dialog, all of its citation styles, automatic bibliography and refresh. Nothing to
 install in Zotero; it only has to be running. The **Zotero** tab in the ribbon has the buttons:
-Add/Edit Citation, Add Note, Add/Edit Bibliography, Refresh, Document Preferences and Unlink
-Citations (each runs one of the commands below).
+Add/Edit Citation, Add Note, Add/Edit Bibliography, Refresh, Document Preferences, Unlink
+Citations and Cancel (each runs one of the commands below).
 
 ## Commands
 
@@ -18,12 +18,15 @@ Citations (each runs one of the commands below).
 | `ui.zotero.addNote` | Insert a Zotero note |
 | `ui.zotero.status` | `{busy, waitingForAnswer, last}` |
 | `ui.zotero.answer` | `{"button": n}`: answer a question Zotero is asking (OK/Yes 1, No/Cancel 0; with Yes/No/Cancel: Yes 2, No 1, Cancel 0) |
+| `ui.zotero.cancel` | End the command in flight (Zotero › Cancel, on only while one runs); `{"cancelled": command}` |
 
 They run in the app (and through the control channel and MCP bridged to the app). A command
 returns at once with `{"started": …}`; Zotero then works in its own window and WordCraft answers
 it in the background. All changes from one command are one undo step. If New or Open replaces
 the document while a command is running, Zotero's remaining calls for it get an error and the
-new document is left as it is.
+new document is left as it is. Cancel closes the connection, so the command ends at once whatever
+Zotero (or anything else on its port) is doing; the edits it already made stay, as one undo step,
+and the other Zotero buttons work again.
 
 From a terminal, against a file:
 
@@ -60,6 +63,12 @@ Word's "Field" in the file.)
 - Zotero's "Bookmarks" field type isn't supported; keep the default.
 - Zotero's document transfer (Export/Import Document) isn't needed and isn't supported.
 - The web version can't reach Zotero (browsers can't open the socket).
+- Any program on the computer could listen on Zotero's port before Zotero does, so one command
+  is bounded: at most 100,000 calls and 128 MiB from Zotero, 8 MiB in one call, and 4 MiB of
+  rich text (RTF or HTML) in one `Field_setText` or `Document_insertText` (a call over it gets an
+  error and changes nothing). A long bibliography is a few hundred KB, so real documents stay
+  far below these. A command whose other end goes quiet ends after 30 minutes (Zotero's own
+  dialogs can wait that long for you), or at once with Cancel.
 
 ## How it works
 
