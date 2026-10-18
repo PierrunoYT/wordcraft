@@ -252,7 +252,9 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
     fn build_row(mut cells: Vec<Cell>, info: &RowInfo) -> Row {
         // Per-cell overrides first (sprm cell indices count pre-merge cells), then merges.
         for (i, c) in cells.iter_mut().enumerate() {
-            let i = i as u8;
+            // Sprm cell indices are bytes: cells past 255 have no overrides (`as u8` wrapped
+            // cell 256 onto cell 0's).
+            let Ok(i) = u8::try_from(i) else { break };
             if let Some((_, m)) = info.vmerge.iter().find(|(k, _)| *k == i) {
                 c.props.vmerge = *m;
             }
@@ -491,5 +493,34 @@ fn i32_of(p: &Prl) -> Option<i32> {
     match p.operand {
         [b0, b1, b2, b3, ..] => Some(i32::from_le_bytes([*b0, *b1, *b2, *b3])),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit minor: the cell index was cast `as u8`, so cell 256 of a wide row took cell 0's
+    /// vertical merge, shading, width and alignment.
+    #[test]
+    fn cells_past_255_take_no_overrides_from_cell_0() {
+        let cell = || ParaOut { para: Paragraph::new(), end_cp: 0, row: RowInfo { in_table: true, cell_mark: true, ..Default::default() } };
+        let mut paras: Vec<ParaOut> = (0..300).map(|_| cell()).collect();
+        let mut end = cell();
+        end.row.ttp = true;
+        end.row.vmerge = vec![(0, VMerge::Restart)];
+        end.row.shading = vec![(0, Some(Rgb(1, 2, 3)))];
+        end.row.widths = vec![(0, 50.0)];
+        end.row.valign = vec![(0, VAlign::Bottom)];
+        paras.push(end);
+        let blocks = assemble(paras);
+        let Some(Block::Table(t)) = blocks.first().map(|b| &**b) else { panic!("no table: {}", blocks.len()) };
+        let cells = &t.rows[0].cells;
+        assert_eq!(cells.len(), 301);
+        let p0 = &cells[0].props;
+        assert_eq!((p0.vmerge, p0.shading, p0.width, p0.valign), (VMerge::Restart, Some(Rgb(1, 2, 3)), Some(50.0), Some(VAlign::Bottom)));
+        for c in &cells[1..] {
+            assert_eq!((c.props.vmerge, c.props.shading, c.props.width, c.props.valign), (VMerge::None, None, None, None));
+        }
     }
 }

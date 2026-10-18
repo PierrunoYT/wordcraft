@@ -268,25 +268,28 @@ pub fn read_with_password(bytes: &[u8], password: Option<&str>) -> Result<Docume
     // header/footer parts included); the section reaching the end of the text is the final one.
     let mut paras = walk(&ctx, 0, fib.ccp.text, &mut pics);
     let last = sects.last().map(|s| s.props.clone());
+    // Looked up by key, not by scanning, so sections × paragraphs stays linear.
+    let hf_at: std::collections::HashMap<(usize, usize), u32> = hf_ids.iter().map(|&(s, k, id)| ((s, k), id)).collect();
+    let mut para_at: std::collections::HashMap<u32, usize> = std::collections::HashMap::with_capacity(paras.len());
+    for (i, p) in paras.iter().enumerate() {
+        para_at.entry(p.end_cp).or_insert(i);
+    }
     for (si, sec) in sects.iter().enumerate() {
         let mut props = sec.props.clone();
-        let id_of = |k: usize| hf_ids.iter().find(|(s, kk, _)| *s == si && *kk == k).map(|(_, _, id)| *id);
+        let id_of = |k: usize| hf_at.get(&(si, k)).copied();
         props.headers = HeaderSet { even: id_of(0), default: id_of(1), first: id_of(4) };
         props.footers = HeaderSet { even: id_of(2), default: id_of(3), first: id_of(5) };
         let is_final = si + 1 == sects.len() || sec.end_cp >= fib.ccp.text;
         if is_final {
             continue; // handled below through `last`
         }
-        for p in paras.iter_mut() {
-            if p.end_cp == sec.end_cp {
-                p.para.section = Some(Box::new(props));
-                break;
-            }
+        if let Some(p) = para_at.get(&sec.end_cp).and_then(|&i| paras.get_mut(i)) {
+            p.para.section = Some(Box::new(props));
         }
     }
     if let Some(mut l) = last {
         let si = sects.len().saturating_sub(1);
-        let id_of = |k: usize| hf_ids.iter().find(|(s, kk, _)| *s == si && *kk == k).map(|(_, _, id)| *id);
+        let id_of = |k: usize| hf_at.get(&(si, k)).copied();
         l.headers = HeaderSet { even: id_of(0), default: id_of(1), first: id_of(4) };
         l.footers = HeaderSet { even: id_of(2), default: id_of(3), first: id_of(5) };
         doc.last_section = l;

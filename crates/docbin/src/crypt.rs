@@ -12,9 +12,11 @@
 //! In all three the WordDocument stream (past its first 68 bytes), the Table stream (past its
 //! header, for RC4) and the whole Data stream are transformed. The password is checked against
 //! the stored verifier before anything is decrypted, so a wrong password is reported and never
-//! yields a garbled document. Everything is written from the public specifications.
+//! yields a garbled document. Everything is written from the public specifications. Keys
+//! derived from the password are wiped from memory when dropped ([`Zeroizing`]).
 
 use sha1::{Digest, Sha1};
+use zeroize::Zeroizing;
 
 use crate::DocbinError;
 
@@ -234,8 +236,8 @@ fn xor_candidates(password: &str) -> Vec<Vec<u8>> {
 
 /// How the streams of one file are transformed, once the password has been verified.
 pub(crate) enum Cipher {
-    Xor { array: [u8; 16] },
-    Rc4 { base: Vec<u8>, crypto_api: bool, key_len: usize, table_skip: usize },
+    Xor { array: Zeroizing<[u8; 16]> },
+    Rc4 { base: Zeroizing<Vec<u8>>, crypto_api: bool, key_len: usize, table_skip: usize },
 }
 
 impl Cipher {
@@ -245,7 +247,7 @@ impl Cipher {
         if flags & F_OBFUSCATED != 0 {
             for pw in xor_candidates(password) {
                 if xor_verifier(&pw) == lkey {
-                    return Ok(Cipher::Xor { array: xor_array(&pw) });
+                    return Ok(Cipher::Xor { array: Zeroizing::new(xor_array(&pw)) });
                 }
             }
             return Err(DocbinError::WrongPassword);
@@ -265,13 +267,13 @@ impl Cipher {
         let salt = table.get(4..20).ok_or_else(short)?;
         let enc_verifier = table.get(20..36).ok_or_else(short)?;
         let enc_hash = table.get(36..52).ok_or_else(short)?;
-        let h0 = md5(&utf16le(password));
-        let mut buf = Vec::with_capacity(336);
+        let h0 = Zeroizing::new(md5(&Zeroizing::new(utf16le(password))));
+        let mut buf = Zeroizing::new(Vec::with_capacity(336));
         for _ in 0..16 {
             buf.extend_from_slice(&h0[..5]);
             buf.extend_from_slice(salt);
         }
-        let base = md5(&buf)[..5].to_vec();
+        let base = Zeroizing::new(md5(&buf)[..5].to_vec());
         let cipher = Cipher::Rc4 { base, crypto_api: false, key_len: 16, table_skip: 52 };
         let mut rc4 = Rc4::new(&cipher.block_key(0));
         let mut verifier = [0u8; 16];
@@ -332,9 +334,8 @@ impl Cipher {
             return Err(unsupported("a verifier hash that is not SHA-1"));
         }
         let enc_hash = table.get(v + 40..v + 60).ok_or_else(short)?;
-        let mut pw = utf16le(password);
-        let base = sha1(&[salt, &pw]);
-        pw.fill(0);
+        let pw = Zeroizing::new(utf16le(password));
+        let base = Zeroizing::new(sha1(&[salt, &pw]));
         let cipher = Cipher::Rc4 { base, crypto_api: true, key_len, table_skip: v + 60 };
         let mut rc4 = Rc4::new(&cipher.block_key(0));
         let mut verifier = enc_verifier.to_vec();
@@ -348,12 +349,14 @@ impl Cipher {
     }
 
     /// The RC4 key of stream block `block`.
-    fn block_key(&self, block: u32) -> Vec<u8> {
+    fn block_key(&self, block: u32) -> Zeroizing<Vec<u8>> {
         match self {
-            Cipher::Xor { .. } => Vec::new(),
-            Cipher::Rc4 { base, crypto_api: false, .. } => md5(&[base.as_slice(), &block.to_le_bytes()].concat()).to_vec(),
+            Cipher::Xor { .. } => Zeroizing::new(Vec::new()),
+            Cipher::Rc4 { base, crypto_api: false, .. } => {
+                Zeroizing::new(md5(&Zeroizing::new([base.as_slice(), &block.to_le_bytes()].concat())).to_vec())
+            }
             Cipher::Rc4 { base, crypto_api: true, key_len, .. } => {
-                let mut k = sha1(&[base, &block.to_le_bytes()]);
+                let mut k = Zeroizing::new(sha1(&[base, &block.to_le_bytes()]));
                 k.truncate(*key_len);
                 // A 40-bit key is zero-padded to 128 bits.
                 if *key_len == 5 {
@@ -435,6 +438,25 @@ mod tests {
         let mut d = b"Plaintext".to_vec();
         Rc4::new(b"Key").apply(&mut d);
         assert_eq!(hex(&d), "bbf316e8d940af0ad3");
+    }
+
+    /// Audit minor: the derived RC4 `base` key outlived the cipher in memory. The keys a cipher
+    /// holds, and each block key it derives, are now wiped on drop (checked by type).
+    #[test]
+    fn derived_keys_are_wiped_on_drop() {
+        fn wiped<T: zeroize::Zeroize>(_: &Zeroizing<T>) {}
+        for crypto_api in [false, true] {
+            let c = Cipher::Rc4 { base: Zeroizing::new(vec![7; 20]), crypto_api, key_len: 5, table_skip: 0 };
+            if let Cipher::Rc4 { base, .. } = &c {
+                wiped(base);
+            }
+            let k = c.block_key(3);
+            assert_eq!(k.len(), 16);
+            wiped(&k);
+        }
+        if let Cipher::Xor { array } = &(Cipher::Xor { array: Zeroizing::new(xor_array(b"pw")) }) {
+            wiped(array);
+        }
     }
 
     #[test]

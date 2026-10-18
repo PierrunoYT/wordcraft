@@ -3,6 +3,8 @@
 
 /// Cap on notes and bookmarks per document.
 const MAX: usize = 10_000;
+/// Longest bookmark name kept, in characters (Word's limit).
+const MAX_NAME: usize = 40;
 
 /// Parse the note reference/story PLCs. `ref_pair`/`txt_pair` are the FIB pair indices
 /// (`(2, 3)` for footnotes, `(46, 47)` for endnotes); story ranges are relative to the
@@ -107,11 +109,36 @@ fn sttb_strings(table: &[u8], fc: u32, lcb: u32) -> Option<Vec<String>> {
             None => break,
         };
         at += 2;
-        let cch = cch.min(40);
+        // Skip the whole string so the next one is read from its own start; the name keeps
+        // Word's 40 characters at most.
         let chars = b.get(at..at + cch * 2)?;
         at += cch * 2;
+        let chars = chars.get(..cch.min(MAX_NAME) * 2).unwrap_or(chars);
         let s: String = chars.as_chunks::<2>().0.iter().map(|c| char::from_u32(u16::from_le_bytes(*c) as u32).unwrap_or('\u{FFFD}')).collect();
         out.push(s);
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit minor: a bookmark name over 40 characters advanced the reader by 40 only, so every
+    /// later name was read from the middle of the long one.
+    #[test]
+    fn long_bookmark_names_dont_desync_the_names_after_them() {
+        let long = "L".repeat(50);
+        let mut sttb = 0xFFFFu16.to_le_bytes().to_vec();
+        sttb.extend_from_slice(&3u16.to_le_bytes());
+        sttb.extend_from_slice(&0u16.to_le_bytes());
+        for name in [long.as_str(), "next", "last"] {
+            sttb.extend_from_slice(&(name.chars().count() as u16).to_le_bytes());
+            for c in name.encode_utf16() {
+                sttb.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let names = sttb_strings(&sttb, 0, sttb.len() as u32).unwrap();
+        assert_eq!(names, ["L".repeat(MAX_NAME), "next".into(), "last".into()]);
+    }
 }

@@ -945,6 +945,37 @@ fn two_sections_box_the_first() {
     assert!(!doc.last_section.title_page);
 }
 
+/// Audit minor: each section scanned every paragraph for the one it ends (sections ×
+/// paragraphs). Many sections over many paragraphs still box the right ones.
+#[test]
+fn many_sections_box_the_paragraphs_that_end_them() {
+    const SECTIONS: u32 = 1000;
+    const PER: u32 = 20;
+    let text: &'static str = Box::leak("p\r".repeat((SECTIONS * PER) as usize).into_boxed_str());
+    let mut sections: Vec<(u32, Vec<u8>)> = (1..SECTIONS).map(|s| (s * PER * 2, grpprl(&[(0x300A, &[0x01])]))).collect();
+    sections.push((SECTIONS * PER * 2, Vec::new()));
+    let spec = StructSpec {
+        text,
+        header_stories: vec![],
+        sections,
+        chpx_runs: vec![(0, Vec::new())],
+        papx_entries: vec![(0, 0, Vec::new())],
+        plf_lst: Vec::new(),
+        plf_lfo: Vec::new(),
+        note_stories: vec![],
+        endnote_stories: vec![],
+        extra_pairs: Vec::new(),
+        data_stream: Vec::new(),
+    };
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    let paras: Vec<_> = doc.body.iter().filter_map(|b| b.as_para()).collect();
+    assert_eq!(paras.len(), (SECTIONS * PER) as usize);
+    for (i, p) in paras.iter().enumerate() {
+        let ends_section = (i as u32 + 1).is_multiple_of(PER) && i as u32 + 1 < SECTIONS * PER;
+        assert_eq!(p.section.as_ref().map(|s| s.title_page), ends_section.then_some(true), "paragraph {i}");
+    }
+}
+
 #[test]
 fn header_story_becomes_part() {
     let spec = StructSpec {
