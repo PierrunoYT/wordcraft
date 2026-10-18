@@ -386,10 +386,14 @@ mod tests {
     #[test]
     fn a_silent_connection_is_closed() {
         let (port, rx) = boot_with(Duration::from_millis(300));
-        let mut quiet = Conn::open(port);
         let t0 = Instant::now();
+        let mut quiet = Conn::open(port);
+        // The server closes it (end of stream, not the client's read timeout) at its 300 ms
+        // deadline. The bounds leave a loaded machine room yet stay far from the 30 s default.
+        quiet.0.get_ref().set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         assert!(quiet.closed());
-        assert!(t0.elapsed() < Duration::from_secs(3));
+        let closed = t0.elapsed();
+        assert!(closed >= Duration::from_millis(250) && closed < Duration::from_secs(10), "{closed:?}");
         // After an authorised request the connection may stay idle.
         let mut busy = Conn::open(port);
         assert_eq!(busy.call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["ok"], true);
@@ -401,31 +405,38 @@ mod tests {
 
     #[test]
     fn the_first_request_limit_is_one_overall_deadline() {
-        // Blank lines and bad JSON do not keep a connection without the key open.
+        // Blank lines and a slow drip of bytes do not keep a connection without the key open
+        // (bad JSON closes it at once: `bad_json_closes_the_connection`). The client keeps
+        // sending for up to 20 s; the server closes at its 300 ms deadline.
+        use std::sync::atomic::{AtomicBool, Ordering};
         let (port, _rx) = boot_with(Duration::from_millis(300));
+        let t0 = Instant::now();
         let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let mut w = s.try_clone().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let feeding = stop.clone();
         let feeder = std::thread::spawn(move || {
-            for i in 0..40 {
-                if w.write_all(if i % 2 == 0 { b"\n" } else { b"not json\n" }).is_err() {
+            for i in 0..400 {
+                if feeding.load(Ordering::Relaxed) || w.write_all(if i % 2 == 0 { b"\n" } else { b" " }).is_err() {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
         });
-        let t0 = Instant::now();
         let mut r = BufReader::new(s);
-        r.get_ref().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        r.get_ref().set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        // No reply to blank lines: the next read sees the server close (end of stream, or a reset
+        // as the client's unread bytes are dropped).
         let mut line = String::new();
-        loop {
-            line.clear();
-            if matches!(r.read_line(&mut line), Ok(0) | Err(_)) {
-                break;
-            }
-            assert!(line.contains("bad JSON"), "{line}");
-        }
+        let read = r.read_line(&mut line);
+        assert!(matches!(read, Ok(0) | Err(_)), "no reply to blank lines: {line}");
+        // Timed when the connection closed (not after the feeder stops, which a loaded machine
+        // can delay): without the overall deadline it stays open while the client sends.
+        let closed = t0.elapsed();
+        stop.store(true, Ordering::Relaxed);
         let _ = feeder.join();
-        assert!(t0.elapsed() < Duration::from_millis(1500), "{:?}", t0.elapsed());
+        assert!(closed >= Duration::from_millis(250), "closed before the deadline: {closed:?}");
+        assert!(closed < Duration::from_secs(10), "{closed:?}");
     }
 
     #[test]
